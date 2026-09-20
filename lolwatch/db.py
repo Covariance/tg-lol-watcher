@@ -16,7 +16,7 @@ import aiosqlite
 
 from .models import Match, Player, Session
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_V1 = """
 CREATE TABLE players (
@@ -74,8 +74,16 @@ CREATE TABLE subscribers (
 -- kv (alert dedupe, schema version, key fingerprint) is created by migrate() itself.
 """
 
+_SCHEMA_V2 = """
+CREATE TABLE allowed_users (
+  user_id        INTEGER PRIMARY KEY,
+  added_by       INTEGER,
+  added_at       INTEGER NOT NULL
+)
+"""
+
 # version -> script that upgrades from version-1. Append; never edit old entries.
-MIGRATIONS: dict[int, str] = {1: _SCHEMA_V1}
+MIGRATIONS: dict[int, str] = {1: _SCHEMA_V1, 2: _SCHEMA_V2}
 
 
 def key_fingerprint(api_key: str) -> str:
@@ -190,7 +198,11 @@ class Database:
                 "added_at, last_seen_ms, name_checked_at) VALUES(?,?,?,?,1,?,?,?,?) "
                 "ON CONFLICT(puuid) DO UPDATE SET active=1, game_name=excluded.game_name, "
                 "tag_line=excluded.tag_line, platform=excluded.platform, "
-                "name_checked_at=excluded.name_checked_at",
+                "name_checked_at=excluded.name_checked_at, "
+                # A player coming back from /remove is new again: games played while
+                # they were untracked must not be announced as fresh.
+                "last_seen_ms=CASE WHEN players.active=0 THEN excluded.last_seen_ms "
+                "ELSE players.last_seen_ms END",
                 (player.puuid, player.game_name, player.tag_line, player.platform,
                  player.added_by, player.added_at, player.last_seen_ms,
                  player.name_checked_at))
@@ -201,11 +213,13 @@ class Database:
 
     async def find_player(self, game_name: str, tag_line: str,
                           active_only: bool = True) -> Player | None:
-        sql = "SELECT * FROM players WHERE game_name=? COLLATE NOCASE AND tag_line=? COLLATE NOCASE"
-        if active_only:
-            sql += " AND active=1"
-        row = await self._fetchone(sql, (game_name, tag_line))
-        return _player(row) if row else None
+        """Riot IDs are case-insensitive. Compared in Python: SQLite's NOCASE only
+        folds ASCII, which would miss Cyrillic/Greek/etc. names."""
+        wanted = (game_name.casefold(), tag_line.casefold())
+        for p in await self.list_players(active_only):
+            if (p.game_name.casefold(), p.tag_line.casefold()) == wanted:
+                return p
+        return None
 
     async def list_players(self, active_only: bool = True) -> list[Player]:
         sql = "SELECT * FROM players"
@@ -260,6 +274,12 @@ class Database:
                 (m.match_id, m.puuid, m.queue_id, m.champion, m.win, int(m.remake), m.kills,
                  m.deaths, m.assists, m.duration_s, m.start_ms, m.end_ms, m.ingested_at))
             return cur.rowcount == 1
+
+    async def delete_match(self, match_id: str, puuid: str) -> None:
+        """Un-store a match so the next poll ingests it again."""
+        async with self.tx() as conn:
+            await conn.execute("DELETE FROM matches WHERE match_id=? AND puuid=?",
+                               (match_id, puuid))
 
     async def matches_between(self, puuid: str, start_ms: int, end_ms: int) -> list[Match]:
         """Matches that *started* in [start_ms, end_ms), oldest first."""
@@ -355,3 +375,25 @@ class Database:
     async def subscribers(self) -> list[int]:
         return [r["chat_id"] for r in await self._fetchall(
             "SELECT chat_id FROM subscribers ORDER BY chat_id")]
+
+    # -- allowed users (who may talk to the bot at all) -----------------------
+
+    async def add_allowed_user(self, user_id: int, added_by: int | None, added_at: int) -> bool:
+        async with self.tx() as conn:
+            cur = await conn.execute(
+                "INSERT OR IGNORE INTO allowed_users(user_id, added_by, added_at) VALUES(?,?,?)",
+                (user_id, added_by, added_at))
+            return cur.rowcount == 1
+
+    async def remove_allowed_user(self, user_id: int) -> bool:
+        async with self.tx() as conn:
+            cur = await conn.execute("DELETE FROM allowed_users WHERE user_id=?", (user_id,))
+            return cur.rowcount == 1
+
+    async def is_allowed_user(self, user_id: int) -> bool:
+        return await self._fetchone(
+            "SELECT 1 FROM allowed_users WHERE user_id=?", (user_id,)) is not None
+
+    async def allowed_users(self) -> list[int]:
+        return [r["user_id"] for r in await self._fetchall(
+            "SELECT user_id FROM allowed_users ORDER BY user_id")]

@@ -91,3 +91,19 @@ def test_build_summary_dates_are_local():
     end = datetime(2026, 9, 20, 20, 0, tzinfo=LONDON)
     s = build_summary(start, end, LONDON, [("A#1", [make_match("a", T0)])], GAP)
     assert (s.start.day, s.end.day) == (14, 20) and s.players[0].games == 1
+
+
+def test_rolling_windows_tile_the_timeline_without_gaps():
+    """The scheduled weekly summary must not lose Sunday 20:00-24:00."""
+    run1 = datetime(2026, 9, 20, 20, 0, tzinfo=LONDON)
+    run2 = datetime(2026, 9, 27, 20, 0, tzinfo=LONDON)
+    _, end1 = window_days(run1, 7, rolling=True)
+    start2, _ = window_days(run2, 7, rolling=True)
+    assert end1 == start2 == run1
+    assert window_days(run2, 7)[0] > end1          # the midnight-aligned window leaves a hole
+
+
+def test_rolling_window_keeps_the_local_clock_time_across_a_dst_change():
+    run = datetime(2026, 3, 30, 20, 0, tzinfo=LONDON)          # BST; a week earlier was GMT
+    start, _ = window_days(run, 7, rolling=True)
+    assert (start.day, start.hour, start.minute) == (23, 20, 0)

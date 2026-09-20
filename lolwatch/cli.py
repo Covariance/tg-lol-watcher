@@ -102,8 +102,9 @@ async def cmd_dry_run_summary(cfg: Config, args: argparse.Namespace) -> int:
     db = await Database.open(cfg.db_path)
     try:
         players = await db.list_players()
+        # 7 days is what the scheduled summary sends (a rolling window); show it as-is.
         for text in await render_window(db, cfg, players, days=args.days,
-                                        now=datetime.now(cfg.tz)):
+                                        now=datetime.now(cfg.tz), rolling=args.days == 7):
             print(re.sub(r"</?(b|pre)>", "", text), end="\n\n")
     finally:
         await db.close()

@@ -90,7 +90,7 @@ async def test_dry_run_summary_prints_plain_text_and_sends_nothing(tmp_path, cap
 
     assert await cli.cmd_dry_run_summary(cfg, argparse.Namespace(days=7)) == 0
     out = capsys.readouterr().out
-    assert "Week of" in out and "Alice#EUW" in out and "1 game" in out
+    assert "Week ending" in out and "Alice#EUW" in out and "1 game" in out
     assert "<b>" not in out and "<pre>" not in out
 
 

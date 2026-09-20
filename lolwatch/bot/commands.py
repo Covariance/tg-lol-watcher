@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from html import escape
+from typing import Literal
 
-from telegram import Update
+from telegram import Bot, BotCommand, BotCommandScopeChat, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
 from ..config import parse_riot_id
 from ..db import key_fingerprint
@@ -18,7 +22,7 @@ from ..models import Player
 from ..reports import broadcast_weekly, render_window
 from ..riot.errors import RiotAuthError, RiotError, RiotNotFound
 from ..riot.routing import is_platform
-from .auth import admin_only, services, subscriber_only
+from .auth import Handler, admin_only, is_admin, services, subscriber_only
 
 log = logging.getLogger(__name__)
 HTML = ParseMode.HTML
@@ -85,6 +89,16 @@ async def _add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     existing = await svc.db.get_player(acct.puuid)
     if existing and existing.active:
         return await _reply(update, f"Already tracking <b>{escape(existing.riot_id)}</b>.")
+    if acct.summoner_level is None:
+        # Account lookups work region-wide, so a wrong platform in the same region gets
+        # this far. Tracking it would silently break the live-game check and game ids.
+        return await _reply(
+            update, f"Found the Riot account <b>{escape(acct.game_name)}#"
+                    f"{escape(acct.tag_line)}</b>, but no League profile on "
+                    f"<code>{platform}</code>. Wrong platform? Try "
+                    f"<code>/add {escape(acct.game_name)}#{escape(acct.tag_line)} "
+                    "&lt;platform&gt;</code>. (If the platform is right, Riot may be "
+                    "flaky: try again in a minute.)")
 
     player = Player(puuid=acct.puuid, game_name=acct.game_name, tag_line=acct.tag_line,
                     platform=platform, added_by=user.id, added_at=now_ms(),
@@ -182,7 +196,7 @@ async def _stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     svc = services(context)
     args = list(context.args or [])
     days = 7
-    if len(args) > 1 and args[-1].isdigit():
+    if len(args) > 1 and args[-1].isascii() and args[-1].isdigit() and len(args[-1]) <= 4:
         days, args = int(args[-1]), args[:-1]
     usage = "Usage: <code>/stats GameName#TAG [days]</code>"
     if not 1 <= days <= 365:
@@ -206,9 +220,72 @@ async def _sendweekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not subscribers:
         return await _reply(update, "No subscribers yet. Send /start in the chat that should "
                                     "receive updates.")
-    await broadcast_weekly(svc.db, svc.cfg, svc.notifier)
+    messages, delivered = await broadcast_weekly(svc.db, svc.cfg, svc.notifier)
+    if delivered < messages:
+        return await _reply(update, f"⚠️ Only {delivered} of {messages} message(s) were "
+                                    "delivered to anyone. Check the logs.")
     await _reply(update, f"✅ Weekly summary sent to {len(subscribers)} "
                          f"chat{'s' if len(subscribers) != 1 else ''}.")
+
+
+# -- who may use the bot -----------------------------------------------------
+
+def _target_user_id(update: Update, args: list[str]) -> int | None:
+    """A numeric Telegram user id from the arguments, or from the message being replied
+    to. Returns None when neither is usable (bots and non-numeric text are rejected)."""
+    if args:
+        text = args[0]
+        if len(args) == 1 and text.isascii() and text.isdigit() and len(text) <= 15:
+            return int(text) or None
+        return None
+    replied = getattr(update.effective_message, "reply_to_message", None)
+    sender = getattr(replied, "from_user", None)
+    if sender is None or getattr(sender, "is_bot", False):
+        return None
+    return sender.id
+
+
+async def _allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    svc = services(context)
+    user = update.effective_user
+    assert user is not None
+    target = _target_user_id(update, list(context.args or []))
+    if target is None:
+        return await _reply(update, "Usage: <code>/allow &lt;user_id&gt;</code>, or reply "
+                                    "to their message with <code>/allow</code>.")
+    if is_admin(svc, target):
+        return await _reply(update, "That user is an admin already.")
+    added = await svc.db.add_allowed_user(target, user.id, now_ms())
+    log.info("allow list: %s %d (by admin %d)", "added" if added else "kept", target, user.id)
+    await _reply(update, f"✅ User <code>{target}</code> may now use the bot." if added
+                 else f"User <code>{target}</code> was already allowed.")
+
+
+async def _disallow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    svc = services(context)
+    user = update.effective_user
+    assert user is not None
+    target = _target_user_id(update, list(context.args or []))
+    if target is None:
+        return await _reply(update, "Usage: <code>/disallow &lt;user_id&gt;</code>, or reply "
+                                    "to their message with <code>/disallow</code>.")
+    if is_admin(svc, target):
+        return await _reply(update, "Admins are set in config.toml and can't be removed here.")
+    removed = await svc.db.remove_allowed_user(target)
+    log.info("allow list: %s %d (by admin %d)", "removed" if removed else "absent",
+             target, user.id)
+    await _reply(update, f"Removed <code>{target}</code>; the bot now ignores them." if removed
+                 else f"User <code>{target}</code> wasn't on the list.")
+
+
+async def _allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    svc = services(context)
+    admins = svc.cfg.telegram.admin_user_ids
+    users = await svc.db.allowed_users()
+    lines = ["<b>Admins</b> (config.toml)", *(f"• <code>{a}</code>" for a in admins),
+             "", "<b>Allowed users</b>"]
+    lines += [f"• <code>{u}</code>" for u in users] or ["(none yet: /allow &lt;user_id&gt;)"]
+    await _reply(update, "\n".join(lines))
 
 
 async def _settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,14 +313,79 @@ async def _settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "\n".join(lines))
 
 
+# -- command table -----------------------------------------------------------
+# The single source of truth: handler registration, /help and Telegram's command
+# menu are all generated from this, so a command cannot exist without being listed.
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    description: str                  # one line; also the text in Telegram's menu
+    access: Literal["subscriber", "admin"]
+    handler: Handler
+    usage: str = ""                   # arguments, e.g. "GameName#TAG [platform]"
+    allow_new_chat: bool = False      # admin commands that work in a not-yet-subscribed chat
+
+
+async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    assert user is not None
+    is_admin = user.id in services(context).cfg.telegram.admin_user_ids
+
+    def line(c: Command) -> str:
+        return f"/{c.name} {escape(c.usage)}".rstrip() + f" — {escape(c.description)}"
+
+    lines = ["<b>Commands</b>", *(line(c) for c in COMMANDS if c.access == "subscriber")]
+    if is_admin:
+        lines += ["", "<b>Admin</b>", *(line(c) for c in COMMANDS if c.access == "admin")]
+    await _reply(update, "\n".join(lines))
+
+
+COMMANDS: tuple[Command, ...] = (
+    Command("help", "Show this list", "subscriber", _help),
+    Command("list", "Tracked players and when they last played", "subscriber", _list),
+    Command("status", "Who is in a game right now", "subscriber", _status),
+    Command("week", "Summary of the last 7 days", "subscriber", _week,
+            usage="[GameName#TAG]"),
+    Command("stats", "Summary for any window (default 7 days)", "subscriber", _stats,
+            usage="GameName#TAG [days]"),
+    Command("start", "Subscribe this chat to updates", "admin", _start, allow_new_chat=True),
+    Command("stop", "Unsubscribe this chat", "admin", _stop),
+    Command("add", "Track a player (imports recent games silently)", "admin", _add,
+            usage="GameName#TAG [platform]"),
+    Command("remove", "Stop tracking a player (history is kept)", "admin", _remove,
+            usage="GameName#TAG"),
+    Command("sendweekly", "Send the weekly summary to all subscribers now", "admin",
+            _sendweekly),
+    Command("allow", "Let a Telegram user use the bot (or reply to their message)", "admin",
+            _allow, usage="[user_id]"),
+    Command("disallow", "Stop the bot answering a user", "admin", _disallow,
+            usage="[user_id]"),
+    Command("allowed", "Who may use the bot", "admin", _allowed),
+    Command("settings", "Effective config, key status, next weekly run", "admin", _settings),
+)
+
+
 def register(app: Application) -> None:
-    app.add_handler(CommandHandler("start", admin_only(_start, allow_new_chat=True)))
-    app.add_handler(CommandHandler("stop", admin_only(_stop)))
-    app.add_handler(CommandHandler("add", admin_only(_add)))
-    app.add_handler(CommandHandler("remove", admin_only(_remove)))
-    app.add_handler(CommandHandler("settings", admin_only(_settings)))
-    app.add_handler(CommandHandler("sendweekly", admin_only(_sendweekly)))
-    app.add_handler(CommandHandler("list", subscriber_only(_list)))
-    app.add_handler(CommandHandler("status", subscriber_only(_status)))
-    app.add_handler(CommandHandler("week", subscriber_only(_week)))
-    app.add_handler(CommandHandler("stats", subscriber_only(_stats)))
+    for c in COMMANDS:
+        handler = (admin_only(c.handler, allow_new_chat=c.allow_new_chat)
+                   if c.access == "admin" else subscriber_only(c.handler))
+        # Only fresh messages: an edited message must not re-run a command.
+        app.add_handler(CommandHandler(c.name, handler, filters=filters.UpdateType.MESSAGE))
+
+
+def menu(*, admin: bool) -> list[BotCommand]:
+    """Commands for Telegram's autocomplete menu (the list shown when typing `/`)."""
+    return [BotCommand(c.name, c.description) for c in COMMANDS
+            if admin or c.access == "subscriber"]
+
+
+async def publish_menu(bot: Bot, admin_ids: Iterable[int]) -> None:
+    """Everyone sees the read commands; each admin's private chat also gets the admin
+    ones. Failures are logged, never fatal: the menu is a convenience."""
+    try:
+        await bot.set_my_commands(menu(admin=False))
+        for admin_id in admin_ids:
+            await bot.set_my_commands(menu(admin=True), scope=BotCommandScopeChat(admin_id))
+    except TelegramError as exc:
+        log.warning("could not publish the command menu: %s", exc)

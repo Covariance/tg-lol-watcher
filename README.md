@@ -140,7 +140,8 @@ Restart the bot. Riot lists a match a minute or two after it ends, so allow for 
 | Exit code 2 with a list of config problems | Fix each listed line in `config.toml` or the environment. All problems are shown at once. |
 | `refusing to start: Riot API key rejected (403)` | The dev key expired (24 h). Copy a fresh one, update `RIOT_API_KEY`, restart. |
 | `refusing to start: Telegram token validation failed` | Wrong `TELEGRAM_BOT_TOKEN`. Re-copy it from @BotFather. |
-| Bot ignores you or replies "Sorry, I can't do that here." | Your user id is not in `admin_user_ids`, or you used a group that hasn't been `/start`ed. |
+| Bot says nothing at all | You are not on the allow list. Ask an admin to `/allow <your id>` (the bot logs the ids it ignores: `ignored a message from user_id=...`). |
+| Bot replies "Sorry, I can't do that here." | The command needs an admin, or you used a group that hasn't been `/start`ed. |
 | Games never show up | Check `/list` shows the player and `/status` works. Matches appear 1 to 2 minutes after they end. Turn on `DEBUG` logging. |
 | `The Riot API key has changed` warning | PUUIDs are per key. Run `uv run python -m lolwatch.cli repuuid`, then restart. |
 | Weekly summary sent at the wrong hour | `weekly.timezone` must be an IANA name such as `Europe/London`, not `GMT+1`. |
@@ -163,17 +164,37 @@ endpoint answers, reimplement `is_in_game` with `httpx` inside
 
 | Command | Who | What |
 |---|---|---|
+| `/help` | subscriber | list the commands you can use |
 | `/start`, `/stop` | admin | subscribe / unsubscribe this chat |
 | `/add GameName#TAG [platform]` | admin | resolve, track, silently import recent history |
 | `/remove GameName#TAG` | admin | stop tracking (history kept) |
-| `/sendweekly` | admin | send the weekly summary to all subscribers now |
+| `/allow [user_id]`, `/disallow [user_id]` | admin | add / remove a user on the allow list (or reply to their message) |
+| `/allowed` | admin | admins and allowed users |
+| `/sendweekly` | admin | send the weekly summary (the last 7 days, ending now) to all subscribers |
 | `/settings` | admin | effective config, key status, next weekly run |
 | `/list` | subscriber | tracked players and when they last played |
 | `/status` | subscriber | who is in a game right now |
 | `/week [GameName#TAG]` | subscriber | summary of the last 7 days (Mon 00:00 → now on a Sunday) |
 | `/stats GameName#TAG [days]` | subscriber | same, for any window (default 7) |
 
-Non-admins get one polite refusal. Group chats are refused unless an admin `/start`ed them.
+### Who can talk to the bot
+
+Access is default-deny, checked in three places (`lolwatch/bot/auth.py`):
+
+1. **Allow list.** Only admins (`telegram.admin_user_ids` in `config.toml`) and users an admin has
+   `/allow`ed (stored in the database) get any reaction. Everyone else is ignored silently, in
+   private chats and in groups alike, so strangers learn nothing, not even that the bot is alive.
+2. **Role.** Admin commands work for admins only, never for allowed users. Allowed users get
+   the read commands (`/help`, `/list`, `/status`, `/week`, `/stats`); if they try more they get
+   one polite refusal.
+3. **Chat.** Outside a private chat, commands only work in a group an admin has `/start`ed.
+
+Messages from bots, or sent on behalf of a chat or channel (anonymous group admins), never count,
+even if their id is listed. Edited messages don't re-run commands.
+
+Getting someone's id: they can message @userinfobot, or you reply to one of their messages in a
+chat with the bot and send `/allow`. Being in a subscribed group is not enough on its own: the
+sender must be on the list too.
 
 ## How sessions work
 

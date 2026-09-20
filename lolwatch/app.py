@@ -9,7 +9,7 @@ from typing import Any
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, ContextTypes
 
-from .bot import commands
+from .bot import auth, commands
 from .bot.auth import services as _svc
 from .config import Config
 from .db import Database, key_fingerprint
@@ -84,8 +84,11 @@ async def _flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     svc = _svc(context)
     try:
-        n = await broadcast_weekly(svc.db, svc.cfg, svc.notifier)
-        log.info("weekly summary: %d message(s)", n)
+        n, delivered = await broadcast_weekly(svc.db, svc.cfg, svc.notifier)
+        log.info("weekly summary: %d message(s), %d delivered", n, delivered)
+        if delivered < n:
+            await svc.alerter.alert("weekly_delivery", "The weekly summary could not be "
+                                    f"delivered ({delivered} of {n} messages). See the logs.")
     except Exception:
         log.exception("weekly summary failed")
         await svc.alerter.alert("weekly_error", "The weekly summary failed. See the logs.")
@@ -134,6 +137,7 @@ def build_application(cfg: Config) -> Application:
         except Exception as exc:
             raise StartupError(f"Telegram token validation failed: {exc}") from exc
         log.info("telegram: connected as @%s", me.username)
+        await commands.publish_menu(app.bot, cfg.telegram.admin_user_ids)
 
         db = await Database.open(cfg.db_path)
         riot = RetryingClient(CassiopeiaClient(cfg.riot_api_key))
@@ -177,6 +181,7 @@ def build_application(cfg: Config) -> Application:
 
     app = (ApplicationBuilder().token(cfg.telegram_bot_token)
            .post_init(post_init).post_shutdown(post_shutdown).build())
+    auth.install(app)          # the allow-list gate must exist before any command
     commands.register(app)
     app.add_error_handler(on_error)
     return app

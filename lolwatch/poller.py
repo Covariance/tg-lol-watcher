@@ -23,6 +23,10 @@ DAY_MS = 86_400_000
 OVERLAP_MS = MAX_GAME_S * 1000
 INITIAL_BACKFILL_DAYS = 7
 NAME_REFRESH_MS = 7 * DAY_MS
+# A match Riot lists but can't serve yet (404) is retried soon: the details lag the list.
+# One that is unparseable or doesn't include the player is deterministic: retry rarely.
+NOT_FOUND_RETRY_MS = 30 * 60_000
+UNUSABLE_RETRY_MS = DAY_MS
 
 AUTH_ALERT = ("Riot API rejected the key (403). The key is probably expired — replace "
               "RIOT_API_KEY and restart. Polling is paused until it works.")
@@ -37,7 +41,8 @@ class Poller:
                  alerter: Alerter | None, clock: Callable[[], int] = now_ms):
         self._db, self._riot, self._sessions = db, riot, sessions
         self._alerter, self._clock = alerter, clock
-        self._bad_matches: set[tuple[str, str]] = set()   # (match_id, puuid) we can't use
+        # (match_id, puuid) we can't use right now -> when to try again (epoch ms)
+        self._bad_matches: dict[tuple[str, str], int] = {}
 
     # -- the scheduled job --------------------------------------------------
 
@@ -104,7 +109,7 @@ class Poller:
             log.warning("ingest: %s returned %d ids (the page limit); older games in the "
                         "window may be missing", player.riot_id, len(ids))
         known = await self._db.known_match_ids(player.puuid, ids)
-        fresh = [i for i in ids if i not in known and (i, player.puuid) not in self._bad_matches]
+        fresh = [i for i in ids if i not in known and not self._is_bad((i, player.puuid))]
 
         rows: list[Match] = []
         for match_id in fresh:
@@ -121,13 +126,34 @@ class Poller:
             log.debug("ingest: stored match=%s player=%s queue=%d start=%d notify=%s",
                       row.match_id, player.riot_id, row.queue_id, row.start_ms, notify)
             if notify and self._sessions is not None:
-                await self._sessions.on_match(player, row)
+                try:
+                    await self._sessions.on_match(player, row)
+                except Exception:
+                    # Stored but never announced would mean it is "known" forever and the
+                    # notification lost. Un-store it so the next poll tries again.
+                    await self._db.delete_match(row.match_id, row.puuid)
+                    raise
 
         newest = max((r.start_ms for r in rows), default=0)
         marker = max(newest, started_at) if first_time else newest
         if marker:
             await self._db.set_last_seen(player.puuid, marker)
         return inserted
+
+    def _is_bad(self, key: tuple[str, str]) -> bool:
+        retry_at = self._bad_matches.get(key)
+        if retry_at is None:
+            return False
+        if self._clock() >= retry_at:
+            del self._bad_matches[key]
+            return False
+        return True
+
+    def _mark_bad(self, key: tuple[str, str], retry_after_ms: int) -> None:
+        now = self._clock()
+        if len(self._bad_matches) > 1000:      # bounded: drop what has expired
+            self._bad_matches = {k: t for k, t in self._bad_matches.items() if t > now}
+        self._bad_matches[key] = now + retry_after_ms
 
     async def _load(self, player: Player, match_id: str,
                     cache: dict[str, MatchData]) -> Match | None:
@@ -137,19 +163,19 @@ class Poller:
             try:
                 data = await self._riot.get_match(match_id, player.platform)
             except RiotNotFound:
-                log.warning("ingest: match %s not found; skipping", match_id)
-                self._bad_matches.add(key)
+                log.warning("ingest: match %s not found (yet?); will retry later", match_id)
+                self._mark_bad(key, NOT_FOUND_RETRY_MS)
                 return None
             except MatchParseError as exc:
                 log.warning("ingest: match %s unparseable (%s); skipping", match_id, exc)
-                self._bad_matches.add(key)
+                self._mark_bad(key, UNUSABLE_RETRY_MS)
                 return None
             cache[match_id] = data
         part = data.participants.get(player.puuid)
         if part is None:
             log.warning("ingest: %s not among participants of %s; skipping",
                         player.riot_id, match_id)
-            self._bad_matches.add(key)
+            self._mark_bad(key, UNUSABLE_RETRY_MS)
             return None
         return Match(
             match_id=match_id, puuid=player.puuid, queue_id=data.queue_id,

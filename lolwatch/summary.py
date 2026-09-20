@@ -63,14 +63,20 @@ class Summary:
     players: tuple[PlayerSummary, ...] = field(default_factory=tuple)
 
 
-def window_days(now: datetime, days: int) -> tuple[datetime, datetime]:
-    """[start, end) for the last `days` calendar days ending now, in now's tz.
+def window_days(now: datetime, days: int, *, rolling: bool = False) -> tuple[datetime, datetime]:
+    """[start, end) for the last `days` days ending now, in now's tz.
 
-    Starts at local midnight so `days=7` on a Sunday evening is exactly
-    Monday 00:00 .. now — the "week" the weekly summary reports.
+    Default: starts at local midnight, so `days=7` on a Sunday evening is exactly
+    Monday 00:00 .. now (what `/week` shows).
+
+    `rolling=True`: starts exactly `days` days before now (same local clock time).
+    The scheduled weekly summary uses it so consecutive runs tile the timeline with no
+    gap: the midnight-aligned window would drop Sunday 20:00-24:00 from every week.
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    if rolling:
+        return now - timedelta(days=days), now
     first_day = now.date() - timedelta(days=days - 1)
     return datetime.combine(first_day, time.min, tzinfo=now.tzinfo), now
 

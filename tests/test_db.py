@@ -8,7 +8,8 @@ from lolwatch.db import SCHEMA_VERSION, Database, key_fingerprint
 async def test_schema_is_created_and_versioned(db: Database):
     assert await db.kv_get("schema_version") == str(SCHEMA_VERSION)
     rows = await db._fetchall("SELECT name FROM sqlite_master WHERE type='table'")
-    assert {"players", "matches", "sessions", "session_matches", "subscribers", "kv"} <= \
+    assert {"players", "matches", "sessions", "session_matches", "subscribers", "kv",
+     "allowed_users"} <= \
         {r["name"] for r in rows}
 
 
@@ -56,7 +57,9 @@ async def test_soft_delete_keeps_history_and_re_adding_reactivates(db: Database)
 
     await db.add_player(make_player(name="AliceRenamed"))          # /add again
     p = await db.get_player("puuid-alice")
-    assert p.active and p.game_name == "AliceRenamed" and p.last_seen_ms == T0
+    assert p.active and p.game_name == "AliceRenamed"
+    # Back from /remove: games played while untracked must not be announced.
+    assert p.last_seen_ms is None
 
 
 async def test_find_player_is_case_insensitive(db: Database):
@@ -119,3 +122,54 @@ def test_key_fingerprint_is_stable_and_does_not_leak_the_key():
     assert key_fingerprint("RGAPI-secret") == key_fingerprint("RGAPI-secret")
     assert key_fingerprint("a") != key_fingerprint("b")
     assert "secret" not in key_fingerprint("RGAPI-secret")
+
+
+async def test_re_adding_an_active_player_keeps_the_polling_marker(db: Database):
+    await db.add_player(make_player(last_seen_ms=T0))
+    await db.add_player(make_player(name="AliceRenamed"))
+    assert (await db.get_player("puuid-alice")).last_seen_ms == T0
+
+
+async def test_find_player_folds_case_beyond_ascii(db: Database):
+    await db.add_player(make_player("p-ru", "Павел", "РУС"))
+    assert (await db.find_player("павел", "рус")).puuid == "p-ru"
+
+
+async def test_delete_match_unstores_it(db: Database):
+    await db.insert_match(make_match("m1", T0))
+    await db.delete_match("m1", "puuid-alice")
+    assert await db.known_match_ids("puuid-alice", ["m1"]) == set()
+
+
+async def test_allowed_users(db: Database):
+    assert await db.add_allowed_user(7, 1, T0) is True
+    assert await db.add_allowed_user(7, 1, T0) is False
+    assert await db.add_allowed_user(3, None, T0) is True
+    assert await db.is_allowed_user(7) and not await db.is_allowed_user(8)
+    assert await db.allowed_users() == [3, 7]
+    assert await db.remove_allowed_user(7) is True
+    assert await db.remove_allowed_user(7) is False
+    assert not await db.is_allowed_user(7)
+
+
+async def test_a_version_1_database_upgrades_and_keeps_its_data(tmp_path):
+    import aiosqlite
+
+    from lolwatch.db import _SCHEMA_V1
+
+    path = str(tmp_path / "old.db")
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        for stmt in filter(None, (x.strip() for x in _SCHEMA_V1.split(";"))):
+            await conn.execute(stmt)
+        await conn.execute("INSERT INTO kv VALUES('schema_version', '1')")
+        await conn.execute("INSERT INTO subscribers VALUES(-5, 0)")
+        await conn.commit()
+
+    db = await Database.open(path)
+    try:
+        assert await db.kv_get("schema_version") == str(SCHEMA_VERSION)
+        assert await db.subscribers() == [-5]
+        assert await db.allowed_users() == []
+    finally:
+        await db.close()

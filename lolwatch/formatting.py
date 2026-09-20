@@ -70,13 +70,24 @@ def format_session(player: Player, matches: list[Match]) -> str:
 
     rows = [(m.champion, queue_group(m.queue_id), fmt_result(m), fmt_kda(m),
              fmt_duration(m.duration_s)) for m in matches]
-    widths = [max(len(r[i]) for r in rows) for i in range(5)]
-    table = "\n".join(
-        f"  {c:<{widths[0]}}  {q:<{widths[1]}}  {res:<{widths[2]}}  "
-        f"{k:<{widths[3]}}  {d:>{widths[4]}}"
-        for c, q, res, k, d in rows)
-    return (f"🎮 <b>{escape(player.riot_id)}</b> — session over\n"
-            f"{' · '.join(header)}\n\n<pre>{escape(table)}</pre>")
+
+    def render(shown: list[tuple[str, ...]]) -> str:
+        widths = [max(len(r[i]) for r in shown) for i in range(5)]
+        table = "\n".join(
+            f"  {c:<{widths[0]}}  {q:<{widths[1]}}  {res:<{widths[2]}}  "
+            f"{k:<{widths[3]}}  {d:>{widths[4]}}"
+            for c, q, res, k, d in shown)
+        hidden = len(rows) - len(shown)
+        note = f"\n(+{plural(hidden, 'earlier game')} not shown)" if hidden else ""
+        return (f"🎮 <b>{escape(player.riot_id)}</b> — session over\n"
+                f"{' · '.join(header)}\n\n<pre>{escape(table)}</pre>{note}")
+
+    # A marathon must not exceed Telegram's limit: cutting the text afterwards would
+    # slice through the <pre> tag and Telegram would reject the whole message.
+    shown = rows
+    while len(render(shown)) > SPLIT_AT and len(shown) > 1:
+        shown = shown[1:]
+    return render(shown)
 
 
 # -- weekly ------------------------------------------------------------------
@@ -127,9 +138,18 @@ def format_player_summary(ps: PlayerSummary, tz: tzinfo) -> str:
     return f"<b>{escape(ps.riot_id)}</b>\n<pre>{escape(chr(10).join(lines))}</pre>"
 
 
-def format_weekly(summary: Summary, tz: tzinfo, limit: int = SPLIT_AT) -> list[str]:
+def window_title(summary: Summary, days: int = 7, rolling: bool = False) -> str:
+    if rolling:
+        return f"Week ending {summary.end.day} {summary.end:%b}"
+    if days == 7:
+        return f"Week of {fmt_date_range(summary.start, summary.end)}"
+    return f"Last {plural(days, 'day')} · {fmt_date_range(summary.start, summary.end)}"
+
+
+def format_weekly(summary: Summary, tz: tzinfo, limit: int = SPLIT_AT, *,
+                  days: int = 7, rolling: bool = False) -> list[str]:
     """One or more messages, each under the Telegram limit, split between players."""
-    title = f"📊 <b>Week of {fmt_date_range(summary.start, summary.end)}</b>"
+    title = f"📊 <b>{window_title(summary, days, rolling)}</b>"
     if not summary.players:
         return [f"{title}\n\nNo tracked players."]
 

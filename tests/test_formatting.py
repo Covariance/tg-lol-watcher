@@ -120,3 +120,22 @@ def test_weekly_splits_across_messages_under_the_telegram_limit():
     joined = "\n".join(messages)
     assert all(f"Player{i:02d}#EUW" in joined for i in range(40))
     assert all(m.count("<pre>") == m.count("</pre>") for m in messages)  # no torn HTML
+
+
+def test_window_titles_say_what_the_window_is():
+    s = Summary(date(2026, 9, 14), date(2026, 9, 20), (_summary(),))
+    assert format_weekly(s, LONDON, rolling=True)[0].startswith("📊 <b>Week ending 20 Sep</b>")
+    assert format_weekly(s, LONDON, days=30)[0].startswith("📊 <b>Last 30 days · 14–20 Sep</b>")
+    assert format_weekly(s, LONDON, days=1)[0].startswith("📊 <b>Last 1 day")
+
+
+def test_a_marathon_session_message_stays_valid_html_under_the_limit():
+    from conftest import MIN, T0, make_match, make_player
+
+    from lolwatch.formatting import format_session
+
+    games = [make_match(f"m{i}", T0 + i * 40 * MIN, 30) for i in range(150)]
+    text = format_session(make_player(), games)
+    assert len(text) <= SPLIT_AT < TELEGRAM_LIMIT
+    assert text.count("<pre>") == text.count("</pre>") == 1
+    assert "earlier games not shown" in text and "150 games" in text

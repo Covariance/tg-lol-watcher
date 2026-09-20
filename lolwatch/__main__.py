@@ -17,7 +17,8 @@ def setup_logging(level: str) -> None:
         level=level, stream=sys.stdout,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # httpx logs full request URLs at INFO, and Telegram's contain the bot token.
-    for noisy in ("httpx", "httpcore", "apscheduler"):
+    # datapipelines (Cassiopeia's engine) logs every query and result at INFO, PUUIDs included.
+    for noisy in ("httpx", "httpcore", "apscheduler", "datapipelines", "cassiopeia"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

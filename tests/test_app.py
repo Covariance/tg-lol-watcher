@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from conftest import MIN, FakeRiot, make_match
-from telegram import Bot
+from telegram import Bot, User
 
 from lolwatch import app as app_module
 from lolwatch.app import KEY_FP, StartupError, _flush_job, _poll_job, build_application
@@ -43,13 +43,23 @@ def riot(monkeypatch):
 @pytest.fixture
 def send(monkeypatch):
     """Fake Telegram: get_me + send_message, recording what would have been sent."""
-    sent: list[tuple[int, str]] = []
+    class Sent(list):
+        menus: list
+
+    sent = Sent()
 
     async def send_message(self, chat_id, text, **kw):
         sent.append((chat_id, text))
 
     monkeypatch.setattr(Bot, "get_me", AsyncMock(return_value=SimpleNamespace(username="tb")))
     monkeypatch.setattr(Bot, "send_message", send_message)
+    menus: list[tuple[list, object]] = []
+
+    async def set_my_commands(self, commands, scope=None, **kw):
+        menus.append((commands, scope))
+
+    monkeypatch.setattr(Bot, "set_my_commands", set_my_commands)
+    sent.menus = menus
     return sent
 
 
@@ -66,6 +76,9 @@ def make_app(tmp_path):
 
 async def start(app):
     await app.post_init(app)
+    # Lets tests push updates through process_update without a network initialize().
+    app._initialized = True
+    app.bot._bot_user = User(id=1, first_name="tb", is_bot=True, username="tb")
     return app.bot_data["svc"]
 
 
@@ -79,6 +92,17 @@ async def test_startup_registers_jobs_and_records_the_key(make_app, riot, send):
         for name in ("poll", "names", "weekly"):
             assert jq.get_jobs_by_name(name), f"job {name!r} not scheduled"
         assert svc.next_weekly() is None          # before the queue starts: None, not a crash
+    finally:
+        await svc.db.close()
+
+
+async def test_startup_publishes_the_command_menu(make_app, riot, send):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        (default, default_scope), (admin, admin_scope) = send.menus
+        assert default_scope is None and admin_scope.chat_id == 777
+        assert {c.command for c in admin} > {c.command for c in default} >= {"help", "list"}
     finally:
         await svc.db.close()
 
@@ -186,3 +210,111 @@ async def test_poll_job_never_raises_even_if_riot_explodes(make_app, riot, send)
         assert any(chat == 777 for chat, _ in send)              # operator told, once
     finally:
         await svc.db.close()
+
+
+# -- the allow-list gate, through the real PTB dispatcher --------------------
+
+def make_update(app, user_id, text, *, chat_type="private", chat_id=None, edited=False,
+                is_bot=False, sender_chat=False):
+    from telegram import Update
+
+    message = {"message_id": 1, "date": 1_700_000_000,
+               "chat": {"id": chat_id or user_id, "type": chat_type},
+               "from": {"id": user_id, "is_bot": is_bot, "first_name": "x"}, "text": text,
+               "entities": [{"type": "bot_command", "offset": 0,
+                             "length": len(text.split()[0])}]}
+    if sender_chat:
+        message["sender_chat"] = {"id": -100, "type": "channel", "title": "c"}
+    key = "edited_message" if edited else "message"
+    return Update.de_json({"update_id": 1, key: message}, app.bot)
+
+
+async def test_the_gate_stops_strangers_before_any_handler_runs(make_app, riot, send):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        await svc.db.add_player(__import__("conftest").make_player())
+        admin, member, stranger = 777, 555, 999
+        await svc.db.add_allowed_user(member, admin, 0)
+
+        for uid in (stranger, 1):                       # nobody on the list: total silence
+            for text in ("/list", "/help", "/status", "/settings", "/allow 999", "/start"):
+                await app.process_update(make_update(app, uid, text))
+        assert list(send) == [] and await svc.db.allowed_users() == [member]
+        assert await svc.db.subscribers() == []
+
+        await app.process_update(make_update(app, member, "/list"))       # allowed: answered
+        assert len(send) == 1 and "Alice#EUW" in send[0][1]
+        await app.process_update(make_update(app, member, "/settings"))   # but not an admin
+        assert send[1][1] == "Sorry, I can't do that here."
+
+        await app.process_update(make_update(app, admin, "/allow 999"))
+        assert 999 in await svc.db.allowed_users()
+        send.clear()
+        await app.process_update(make_update(app, stranger, "/list"))     # now listed
+        assert len(send) == 1
+        await app.process_update(make_update(app, admin, "/disallow 999"))
+        send.clear()
+        await app.process_update(make_update(app, stranger, "/list"))     # and unlisted again
+        assert list(send) == []
+    finally:
+        await svc.db.close()
+
+
+async def test_the_gate_ignores_edits_bots_and_on_behalf_of_senders(make_app, riot, send):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        await app.process_update(make_update(app, 777, "/list", edited=True))
+        await app.process_update(make_update(app, 777, "/list", is_bot=True))
+        await app.process_update(make_update(app, 777, "/list", sender_chat=True))
+        assert list(send) == []
+        await app.process_update(make_update(app, 777, "/list"))          # the real thing works
+        assert len(send) == 1
+    finally:
+        await svc.db.close()
+
+
+async def test_the_gate_fails_closed_when_the_allow_list_is_unreadable(make_app, riot, send):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        svc.db.is_allowed_user = AsyncMock(side_effect=RuntimeError("db down"))
+        await app.process_update(make_update(app, 555, "/list"))
+        assert list(send) == []                          # not answered, not crashed open
+    finally:
+        await svc.db.close()
+
+
+async def test_a_command_addressed_to_another_bot_is_ignored(make_app, riot, send):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        await app.process_update(make_update(app, 777, "/list@some_other_bot"))
+        assert list(send) == []
+    finally:
+        await svc.db.close()
+
+
+async def test_weekly_job_alerts_the_admin_when_nothing_was_delivered(make_app, riot, send,
+                                                                      monkeypatch):
+    _, app = make_app()
+    svc = await start(app)
+    try:
+        await svc.db.add_subscriber(-100, 0)
+        from lolwatch.notifier import Notifier
+
+        async def undelivered(self, text):
+            return False
+
+        monkeypatch.setattr(Notifier, "broadcast", undelivered)
+        monkeypatch.setattr(Bot, "send_message", lambda self, chat_id, text, **kw: _record(
+            send, chat_id, text))
+        await app_module._weekly_job(SimpleNamespace(application=app))
+        assert any(chat == 777 and "could not be delivered" in text for chat, text in send)
+    finally:
+        await svc.db.close()
+
+
+async def _record(sent, chat_id, text):
+    sent.append((chat_id, text))

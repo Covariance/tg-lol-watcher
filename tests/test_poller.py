@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 from conftest import MIN, T0, Env, make_player
 
@@ -178,3 +179,42 @@ async def test_refresh_names_updates_stale_display_names(env: Env):
     assert (p.game_name, p.tag_line, p.name_checked_at) == ("NewName", "NEW", env.clock.now)
     assert await poller.refresh_names() == 0            # fresh: not re-checked
 
+
+async def test_a_match_riot_cannot_serve_yet_is_retried_not_blacklisted(env: Env):
+    poller, _ = make_poller(env)
+    await env.db.set_last_seen("puuid-alice", T0)
+    env.clock.set(T0 + 60 * MIN)
+    env.riot.ids["puuid-alice"] = ["EUW1_9"]
+    served = {"n": 0}
+    good = match_data("EUW1_9", T0 + 10 * MIN)
+
+    async def flaky(match_id, platform):
+        served["n"] += 1
+        if served["n"] == 1:
+            raise RiotNotFound("details lag the list")
+        return good
+
+    env.riot.get_match = flaky
+    assert await poller.poll_once() == 0                    # 404: skipped for now
+    env.clock.set(T0 + 70 * MIN)
+    assert await poller.poll_once() == 0 and served["n"] == 1   # not hammered every poll
+    env.clock.set(T0 + 100 * MIN)                           # past the retry delay
+    assert await poller.poll_once() == 1                    # picked up, no restart needed
+    assert len(await env.db.matches_between("puuid-alice", 0, 2**60)) == 1
+
+
+async def test_a_notification_failure_unstores_the_match_so_it_is_retried(env: Env):
+    poller, _ = make_poller(env)
+    await env.db.set_last_seen("puuid-alice", T0)
+    env.clock.set(T0 + 60 * MIN)
+    env.riot.ids["puuid-alice"] = ["EUW1_1"]
+    env.riot.matches["EUW1_1"] = match_data("EUW1_1", T0 + 10 * MIN)
+
+    original = env.service.on_match
+    env.service.on_match = AsyncMock(side_effect=RuntimeError("db hiccup"))
+    assert await poller.poll_once() == 0                    # poll_once swallows and alerts
+    assert await env.db.matches_between("puuid-alice", 0, 2**60) == []
+
+    env.service.on_match = original
+    assert await poller.poll_once() == 1
+    assert len(await env.db.open_sessions()) == 1           # announced after all

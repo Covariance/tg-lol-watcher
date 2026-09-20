@@ -1,0 +1,25 @@
+{
+  "metadata": {
+    "matchId": "EUW1_7000000006"
+  },
+  "info": {
+    "gameCreation": 1757000000000,
+    "gameStartTimestamp": 1757000000000,
+    "gameEndTimestamp": 1757090000000,
+    "gameDuration": 90000000,
+    "queueId": 420,
+    "participants": [
+      {
+        "puuid": "puuid-alice",
+        "championName": "Azir",
+        "championId": 1,
+        "win": true,
+        "kills": 1,
+        "deaths": 1,
+        "assists": 1,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": false
+      }
+    ]
+  }
+}

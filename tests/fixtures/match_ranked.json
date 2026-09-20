@@ -1,0 +1,48 @@
+{
+  "metadata": {
+    "matchId": "EUW1_7000000001"
+  },
+  "info": {
+    "gameCreation": 1756999955000,
+    "gameStartTimestamp": 1757000000000,
+    "gameEndTimestamp": 1757001860000,
+    "gameDuration": 1860,
+    "queueId": 420,
+    "gameMode": "CLASSIC",
+    "participants": [
+      {
+        "puuid": "puuid-alice",
+        "championName": "Azir",
+        "championId": 1,
+        "win": true,
+        "kills": 8,
+        "deaths": 2,
+        "assists": 11,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": false
+      },
+      {
+        "puuid": "puuid-bob",
+        "championName": "MonkeyKing",
+        "championId": 1,
+        "win": true,
+        "kills": 3,
+        "deaths": 4,
+        "assists": 9,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": false
+      },
+      {
+        "puuid": "puuid-x1",
+        "championName": "Ahri",
+        "championId": 1,
+        "win": false,
+        "kills": 5,
+        "deaths": 5,
+        "assists": 5,
+        "teamId": 200,
+        "gameEndedInEarlySurrender": false
+      }
+    ]
+  }
+}

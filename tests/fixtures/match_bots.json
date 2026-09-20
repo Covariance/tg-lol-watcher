@@ -1,0 +1,36 @@
+{
+  "metadata": {
+    "matchId": "EUW1_7000000005"
+  },
+  "info": {
+    "gameCreation": 1757000000000,
+    "gameStartTimestamp": 1757000000000,
+    "gameEndTimestamp": 1757000900000,
+    "gameDuration": 900,
+    "queueId": 830,
+    "participants": [
+      {
+        "puuid": "puuid-alice",
+        "championName": "Jinx",
+        "championId": 1,
+        "win": true,
+        "kills": 6,
+        "deaths": 1,
+        "assists": 3,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": false
+      },
+      {
+        "puuid": "BOT",
+        "championName": "Garen",
+        "championId": 1,
+        "win": false,
+        "kills": 0,
+        "deaths": 6,
+        "assists": 0,
+        "teamId": 200,
+        "gameEndedInEarlySurrender": false
+      }
+    ]
+  }
+}

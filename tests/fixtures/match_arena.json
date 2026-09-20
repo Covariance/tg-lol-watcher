@@ -1,0 +1,26 @@
+{
+  "metadata": {
+    "matchId": "EUW1_7000000004"
+  },
+  "info": {
+    "gameCreation": 1757000000000,
+    "gameStartTimestamp": 1757000000000,
+    "gameEndTimestamp": 1757001380000,
+    "gameDuration": 1380,
+    "queueId": 1700,
+    "participants": [
+      {
+        "puuid": "puuid-alice",
+        "championName": "Lux",
+        "championId": 1,
+        "win": true,
+        "kills": 12,
+        "deaths": 6,
+        "assists": 4,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": false,
+        "placement": 2
+      }
+    ]
+  }
+}

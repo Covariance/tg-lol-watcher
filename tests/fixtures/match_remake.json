@@ -1,0 +1,25 @@
+{
+  "metadata": {
+    "matchId": "EUW1_7000000003"
+  },
+  "info": {
+    "gameCreation": 1757000000000,
+    "gameStartTimestamp": 1757000000000,
+    "gameEndTimestamp": 1757000200000,
+    "gameDuration": 200,
+    "queueId": 420,
+    "participants": [
+      {
+        "puuid": "puuid-alice",
+        "championName": "Orianna",
+        "championId": 1,
+        "win": false,
+        "kills": 0,
+        "deaths": 0,
+        "assists": 0,
+        "teamId": 100,
+        "gameEndedInEarlySurrender": true
+      }
+    ]
+  }
+}

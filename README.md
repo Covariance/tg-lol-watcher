@@ -168,7 +168,7 @@ endpoint answers, reimplement `is_in_game` with `httpx` inside
 | `/remove GameName#TAG` | admin | stop tracking (history kept) |
 | `/sendweekly` | admin | send the weekly summary to all subscribers now |
 | `/settings` | admin | effective config, key status, next weekly run |
-| `/list` | subscriber | tracked players and last game seen |
+| `/list` | subscriber | tracked players and when they last played |
 | `/status` | subscriber | who is in a game right now |
 | `/week [GameName#TAG]` | subscriber | summary of the last 7 days (Mon 00:00 → now on a Sunday) |
 | `/stats GameName#TAG [days]` | subscriber | same, for any window (default 7) |

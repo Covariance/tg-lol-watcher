@@ -145,6 +145,7 @@ Restart the bot. Riot lists a match a minute or two after it ends, so allow for 
 | Games never show up | Check `/list` shows the player and `/status` works. Matches appear 1 to 2 minutes after they end. Turn on `DEBUG` logging. |
 | `The Riot API key has changed` warning | PUUIDs are per key. Run `uv run python -m lolwatch.cli repuuid`, then restart. |
 | Weekly summary sent at the wrong hour | `weekly.timezone` must be an IANA name such as `Europe/London`, not `GMT+1`. |
+| `unknown timezone` for a valid name on Linux | The system has no tz database (minimal containers). Install it: `apt install tzdata`. |
 
 ### Live smoke test (do this before trusting the bot)
 

@@ -5,9 +5,8 @@ requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.22.1",
     "httpx>=0.28.1",
-    "python-dotenv>=1.2.3",
     "python-telegram-bot[job-queue]>=21",
-    "tzdata>=2026.4",
+    "tzdata>=2026.4; sys_platform == 'win32'",   # Linux/macOS ship the tz database
 ]
 
 [dependency-groups]

@@ -60,6 +60,20 @@ def test_dotenv_is_loaded_but_real_environment_wins(tmp_path, monkeypatch):
     assert cfg.riot_api_key == "from-env" and cfg.telegram_bot_token == "9:file"
 
 
+def test_dotenv_parsing(tmp_path, monkeypatch):
+    from lolwatch.config import load_dotenv
+    (tmp_path / ".env").write_text(
+        "# comment\n\nexport A_KEY=plain\nB_KEY = 'single quoted'\n"
+        'C_KEY="double # not a comment"\nnot a line\nD_KEY=\n', encoding="utf8")
+    for k in ("A_KEY", "B_KEY", "C_KEY", "D_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    load_dotenv(tmp_path / ".env")
+    import os
+    assert os.environ["A_KEY"] == "plain" and os.environ["B_KEY"] == "single quoted"
+    assert os.environ["C_KEY"] == "double # not a comment" and os.environ["D_KEY"] == ""
+    load_dotenv(tmp_path / "missing.env")          # absent file is fine
+
+
 def test_every_problem_is_reported_at_once(tmp_path):
     bad = """
 [riot]

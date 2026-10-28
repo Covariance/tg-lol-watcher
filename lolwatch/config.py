@@ -12,8 +12,6 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from dotenv import load_dotenv
-
 from .riot.routing import PLATFORMS
 
 MODES = ("session", "per_game", "off")
@@ -112,6 +110,24 @@ def _section(errors: list[str], raw: Mapping[str, Any], name: str) -> Mapping[st
     return value
 
 
+def load_dotenv(path: str | Path = ".env") -> None:
+    """Minimal `.env` support: `KEY=value` lines, `#` comments, optional `export `
+    and surrounding quotes. Variables already in the environment win."""
+    try:
+        lines = Path(path).read_text(encoding="utf8").splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
+
 def load_config(path: str | Path | None = None,
                 env: Mapping[str, str] | None = None, *,
                 need_telegram: bool = True) -> Config:
@@ -121,7 +137,7 @@ def load_config(path: str | Path | None = None,
     When `env` is omitted, `./.env` is loaded first; real environment variables win.
     """
     if env is None:
-        load_dotenv(".env", override=False)
+        load_dotenv(".env")
         env = os.environ
     path = Path(path or env.get("LOLWATCH_CONFIG") or "config.toml")
     errors: list[str] = []

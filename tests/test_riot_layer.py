@@ -1,13 +1,15 @@
-"""Riot adapter internals that can be verified offline: retry policy, error mapping,
-and the Cassiopeia -> match-v5 translation. No network."""
+"""Riot adapter internals verified offline: retry policy, the HTTP client against a
+mock transport (URLs, routing, error mapping), and the rate limiter. No network."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import httpx
 import pytest
 from conftest import FakeRiot, load_fixture
 
 from lolwatch.models import WIN
-from lolwatch.riot.cassiopeia_impl import _split_match_id, core_to_info, map_exception
 from lolwatch.riot.errors import (
     RiotAuthError,
     RiotBadRequest,
@@ -15,7 +17,8 @@ from lolwatch.riot.errors import (
     RiotRateLimited,
     RiotUnavailable,
 )
-from lolwatch.riot.parsing import parse_match
+from lolwatch.riot.http_client import HttpRiotClient, RateLimiter, _split_match_id
+from lolwatch.riot.parsing import MatchParseError
 from lolwatch.riot.retry import RetryingClient
 from lolwatch.riot.routing import PLATFORM_TO_REGION, is_platform, region_for
 
@@ -76,59 +79,170 @@ async def test_definitive_errors_are_never_retried(error):
     assert inner.calls == 1 and sleeps == []
 
 
-# -- error mapping -----------------------------------------------------------
+# -- HTTP client -------------------------------------------------------------
 
-class HttpError(Exception):
-    def __init__(self, code, headers=None):
-        super().__init__(f"HTTP {code}")
-        self.code = code
-        self.response_headers = headers or {}
+class Riot:
+    """Mock Riot: routes `host + path` to (status, json, headers) and records requests."""
+
+    def __init__(self, routes):
+        self.routes, self.requests = routes, []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        key = f"{request.url.host.split('.')[0]}{request.url.path}"
+        status, body, headers = self.routes.get(key, (404, {"status": {}}, {}))
+        return httpx.Response(status, json=body, headers=headers)
+
+
+class NoLimit(RateLimiter):
+    async def acquire(self):
+        pass
+
+
+def client(routes):
+    riot = Riot(routes)
+    return HttpRiotClient("RGAPI-test", transport=httpx.MockTransport(riot),
+                          limiter=NoLimit()), riot
+
+
+ACCOUNT = {"puuid": "puuid-alice", "gameName": "Alice", "tagLine": "EUW"}
+
+
+async def test_resolve_account_routes_by_region_and_sends_the_key():
+    c, riot = client({
+        "europe/riot/account/v1/accounts/by-riot-id/Al ice/EUW": (200, ACCOUNT, {}),
+        "euw1/lol/summoner/v4/summoners/by-puuid/puuid-alice": (200, {"summonerLevel": 321}, {}),
+    })
+    acct = await c.resolve_account("Al ice", "EUW", "euw1")
+    assert (acct.puuid, acct.game_name, acct.tag_line, acct.summoner_level) == \
+        ("puuid-alice", "Alice", "EUW", 321)
+    assert riot.requests[0].headers["X-Riot-Token"] == "RGAPI-test"
+    assert "Al%20ice" in str(riot.requests[0].url)
+
+
+async def test_resolve_account_survives_a_failed_level_lookup():
+    c, _ = client({"americas/riot/account/v1/accounts/by-riot-id/Bob/NA1": (200, ACCOUNT, {})})
+    assert (await c.resolve_account("Bob", "NA1", "na1")).summoner_level is None
+
+
+async def test_sea_accounts_are_served_from_asia():
+    c, _ = client({"asia/riot/account/v1/accounts/by-puuid/p": (200, ACCOUNT, {})})
+    assert (await c.account_by_puuid("p", "oc1")).game_name == "Alice"
+
+
+async def test_account_without_a_riot_id_is_not_found():
+    c, _ = client({"europe/riot/account/v1/accounts/by-puuid/p": (200, {"puuid": "p"}, {})})
+    with pytest.raises(RiotNotFound):
+        await c.account_by_puuid("p", "euw1")
+
+
+async def test_recent_match_ids_sends_start_time_in_seconds():
+    c, riot = client({"europe/lol/match/v5/matches/by-puuid/p/ids":
+                      (200, ["EUW1_2", "EUW1_1"], {})})
+    since = datetime(2026, 1, 1, tzinfo=UTC)
+    assert await c.recent_match_ids("p", "euw1", since, 5) == ["EUW1_2", "EUW1_1"]
+    params = riot.requests[0].url.params
+    assert params["startTime"] == str(int(since.timestamp()))
+    assert (params["start"], params["count"]) == ("0", "5")
+
+    await c.recent_match_ids("p", "euw1", None)
+    assert "startTime" not in riot.requests[1].url.params
+
+
+async def test_get_match_parses_info_and_routes_by_the_match_id():
+    c, _ = client({"europe/lol/match/v5/matches/EUW1_7000000001":
+                   (200, load_fixture("match_ranked"), {})})
+    match = await c.get_match("EUW1_7000000001", "na1")   # the id, not the player, decides
+    assert match.participants["puuid-alice"].win == WIN
+    assert match.participants["puuid-bob"].champion == "Wukong"
+
+
+async def test_get_match_without_info_is_unparseable():
+    c, _ = client({"europe/lol/match/v5/matches/EUW1_1": (200, {"metadata": {}}, {})})
+    with pytest.raises(MatchParseError):
+        await c.get_match("EUW1_1", "euw1")
+
+
+async def test_spectator_200_is_in_game_and_404_is_not():
+    path = "euw1/lol/spectator/v5/active-games/by-summoner/"
+    c, riot = client({path + "playing": (200, {"gameId": 1}, {})})
+    assert await c.is_in_game("playing", "euw1") is True
+    assert await c.is_in_game("idle", "euw1") is False
+    assert len(riot.requests) == 2               # one call each, no summoner lookup
 
 
 @pytest.mark.parametrize("code, expected", [
     (401, RiotAuthError), (403, RiotAuthError), (404, RiotNotFound), (400, RiotBadRequest),
     (429, RiotRateLimited), (500, RiotUnavailable), (503, RiotUnavailable),
 ])
-def test_http_codes_map_to_typed_errors(code, expected):
-    assert isinstance(map_exception(HttpError(code)), expected)
+async def test_http_codes_map_to_typed_errors(code, expected):
+    c, _ = client({"europe/riot/account/v1/accounts/by-puuid/p": (code, {}, {})})
+    with pytest.raises(expected):
+        await c.account_by_puuid("p", "euw1")
 
 
-def test_403_is_auth_even_though_cassiopeia_names_it_a_request_error():
-    class APIRequestError(HttpError):    # Cassiopeia's actual class for 403
-        pass
-    assert isinstance(map_exception(APIRequestError(403)), RiotAuthError)
+@pytest.mark.parametrize("kind", ["application", "method", "service", "server", None])
+async def test_every_429_is_a_rate_limit_carrying_retry_after(kind):
+    headers = {"Retry-After": "11"} | ({"X-Rate-Limit-Type": kind} if kind else {})
+    c, _ = client({"europe/riot/account/v1/accounts/by-puuid/p": (429, {}, headers)})
+    with pytest.raises(RiotRateLimited) as info:
+        await c.account_by_puuid("p", "euw1")
+    assert info.value.retry_after == 11.0
 
 
-def test_exhausted_429_arrives_as_a_bare_runtimeerror_in_cassiopeia():
-    mapped = map_exception(RuntimeError('Encountered an HTTP error code 429 with message "x"'))
-    assert isinstance(mapped, RiotRateLimited)
+async def test_network_failures_are_unavailable():
+    def boom(request):
+        raise httpx.ConnectTimeout("slow", request=request)
+    c = HttpRiotClient("k", transport=httpx.MockTransport(boom), limiter=NoLimit())
+    with pytest.raises(RiotUnavailable):
+        await c.is_in_game("p", "euw1")
 
 
-def test_retry_after_header_is_carried():
-    mapped = map_exception(HttpError(429, {"Retry-After": "12"}))
-    assert mapped.retry_after == 12.0
+async def test_a_429_pauses_the_limiter():
+    paused = []
+
+    class Recording(NoLimit):
+        def pause(self, seconds):
+            paused.append(seconds)
+
+    riot = Riot({"europe/riot/account/v1/accounts/by-puuid/p": (429, {}, {"Retry-After": "7"})})
+    c = HttpRiotClient("k", transport=httpx.MockTransport(riot), limiter=Recording())
+    with pytest.raises(RiotRateLimited):
+        await c.account_by_puuid("p", "euw1")
+    assert paused == [7.0]
 
 
-def test_unknown_rate_limit_type_from_cassiopeia_is_a_rate_limit():
-    # Riot's `X-Rate-Limit-Type: server` makes Cassiopeia raise a ValueError
-    exc = ValueError("Unknown cause of rate limit; aborting. Headers were: "
-                     "{'Content-Type': 'application/json', 'Retry-After': '11', "
-                     "'X-Rate-Limit-Type': 'server'}")
-    mapped = map_exception(exc)
-    assert isinstance(mapped, RiotRateLimited) and mapped.retry_after == 11.0
-    assert "Headers were" not in str(mapped)
+# -- rate limiter ------------------------------------------------------------
 
-    mapped = map_exception(ValueError("Unknown cause of rate limit; aborting. Headers were: {}"))
-    assert isinstance(mapped, RiotRateLimited) and mapped.retry_after is None
+class FakeTime:
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def clock(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
-def test_pipeline_not_found_and_network_failures():
-    class NotFoundError(Exception):
-        pass
-    assert isinstance(map_exception(NotFoundError("no such summoner")), RiotNotFound)
-    assert isinstance(map_exception(TimeoutError("slow")), RiotUnavailable)
-    assert isinstance(map_exception(ConnectionResetError("reset")), RiotUnavailable)
-    assert map_exception(ValueError("a genuine bug")) is None      # bugs must not be masked
+async def test_limiter_waits_for_the_tightest_window():
+    t = FakeTime()
+    limiter = RateLimiter(((2, 1.0), (3, 10.0)), clock=t.clock, sleep=t.sleep)
+    for _ in range(3):
+        await limiter.acquire()
+    assert t.sleeps == [1.0]                     # third call: the 2-per-second window
+    await limiter.acquire()
+    assert t.sleeps == [1.0, 9.0]                # fourth: the 3-per-10s window
+    assert t.now == 10.0
+
+
+async def test_limiter_pause_holds_every_caller():
+    t = FakeTime()
+    limiter = RateLimiter(((100, 1.0),), clock=t.clock, sleep=t.sleep)
+    limiter.pause(11)
+    await limiter.acquire()
+    assert t.now == 11
 
 
 # -- routing -----------------------------------------------------------------
@@ -146,49 +260,3 @@ def test_split_match_id():
     assert _split_match_id("EUW1_7000000001") == ("EUW1", 7000000001)
     with pytest.raises(ValueError):
         _split_match_id("garbage")
-
-
-# -- Cassiopeia core-data translation ---------------------------------------
-
-def test_cassiopeia_core_data_round_trips_through_the_shared_parser():
-    """Feed a fixture through Cassiopeia's own MatchData constructor, rebuild the
-    info dict from it, and check we recover the same result as parsing directly.
-    Guards the `_data` reach-in in cassiopeia_impl against upstream drift."""
-    from cassiopeia.core.match import MatchData as CoreMatchData
-
-    raw = load_fixture("match_ranked")["info"]
-    core_kwargs = {**raw, "platformId": "EUW1", "gameId": 1, "teams": [
-        {"teamId": 100, "win": True, "bans": [], "objectives": {}}]}
-    rebuilt = core_to_info(CoreMatchData(**core_kwargs))
-    via_cassiopeia = parse_match("EUW1_7000000001", rebuilt)
-    direct = parse_match("EUW1_7000000001", raw)
-
-    assert via_cassiopeia == direct
-    assert via_cassiopeia.participants["puuid-alice"].win == WIN
-    assert via_cassiopeia.participants["puuid-alice"].kills == 8
-    assert via_cassiopeia.participants["puuid-bob"].champion == "Wukong"
-
-
-def test_cassiopeia_remake_flag_survives_the_translation():
-    from cassiopeia.core.match import MatchData as CoreMatchData
-
-    raw = load_fixture("match_remake")["info"]
-    core = CoreMatchData(**{**raw, "platformId": "EUW1", "gameId": 1, "teams": [
-        {"teamId": 100, "win": False, "bans": [], "objectives": {}}]})
-    assert parse_match("x", core_to_info(core)).remake
-
-
-def test_cassiopeia_http_calls_get_a_timeout(monkeypatch):
-    """Its requests-based fallback sets none, so a hung connection would freeze polling."""
-    import requests
-    from cassiopeia.datastores import common
-
-    from lolwatch.riot.cassiopeia_impl import HTTP_TIMEOUT_S
-
-    if common.USE_PYCURL:
-        pytest.skip("pycurl client in use")
-    seen = {}
-    monkeypatch.setattr(requests, "get", lambda url, **kw: seen.update(kw))
-    common.requests.get("https://example.invalid", headers={"a": "b"})
-    assert seen["timeout"] == HTTP_TIMEOUT_S and seen["headers"] == {"a": "b"}
-    assert common.requests.Session is requests.Session      # everything else passes through

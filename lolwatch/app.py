@@ -17,8 +17,8 @@ from .flusher import SessionService
 from .notifier import Alerter, Notifier
 from .poller import Poller
 from .reports import broadcast_weekly
-from .riot.cassiopeia_impl import CassiopeiaClient
 from .riot.errors import RiotAuthError, RiotError
+from .riot.http_client import HttpRiotClient
 from .riot.retry import RetryingClient
 from .services import Services
 
@@ -140,7 +140,9 @@ def build_application(cfg: Config) -> Application:
         await commands.publish_menu(app.bot, cfg.telegram.admin_user_ids)
 
         db = await Database.open(cfg.db_path)
-        riot = RetryingClient(CassiopeiaClient(cfg.riot_api_key))
+        http = HttpRiotClient(cfg.riot_api_key)
+        app.bot_data["http"] = http
+        riot = RetryingClient(http)
         notifier = Notifier(app.bot, db)
         alerter = Alerter(notifier, db, cfg.telegram.admin_user_ids)
         scheduler = PtbFlushScheduler(app, _flush_job)
@@ -175,6 +177,8 @@ def build_application(cfg: Config) -> Application:
         svc = app.bot_data.get("svc")
         if svc:
             await svc.db.close()
+        if http := app.bot_data.get("http"):
+            await http.aclose()
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("unhandled telegram error", exc_info=context.error)

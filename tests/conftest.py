@@ -78,6 +78,7 @@ class FakeRiot:
         self.get_match_calls: list[str] = []
         self.id_calls: list[tuple[str, datetime | None, int]] = []
         self.accounts: dict[tuple[str, str], AccountInfo] = {}
+        self.closed = False
         self.by_puuid: dict[str, AccountInfo] = {}
         self.error: Exception | None = None
 
@@ -104,6 +105,9 @@ class FakeRiot:
         if isinstance(self.in_game, Exception):
             raise self.in_game
         return self.in_game
+
+    async def aclose(self):
+        self.closed = True
 
 
 def make_player(puuid: str = "puuid-alice", name: str = "Alice", tag: str = "EUW",

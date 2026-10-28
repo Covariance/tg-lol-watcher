@@ -21,8 +21,8 @@ from .db import Database, key_fingerprint
 from .poller import Poller
 from .reports import render_window
 from .riot.adapter import RiotClient
-from .riot.cassiopeia_impl import CassiopeiaClient
 from .riot.errors import RiotAuthError, RiotError, RiotNotFound
+from .riot.http_client import HttpRiotClient
 from .riot.retry import RetryingClient
 from .riot.routing import PLATFORMS
 
@@ -30,7 +30,7 @@ log = logging.getLogger("lolwatch.cli")
 
 
 def _riot(cfg: Config) -> RiotClient:
-    return RetryingClient(CassiopeiaClient(cfg.riot_api_key))
+    return RetryingClient(HttpRiotClient(cfg.riot_api_key))
 
 
 async def cmd_resolve(cfg: Config, args: argparse.Namespace) -> int:

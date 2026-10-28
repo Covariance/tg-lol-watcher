@@ -1,4 +1,4 @@
-"""Pure match-v5 `info` -> MatchData parsing. No I/O, no Cassiopeia.
+"""Pure match-v5 `info` -> MatchData parsing. No I/O.
 
 This is where the known traps in the spec live (duration units, remakes, Arena),
 so it is kept separate from any transport and tested against recorded JSON.

@@ -35,7 +35,7 @@ timezone = "Europe/London"
 def riot(monkeypatch):
     fake = FakeRiot()
     fake.accounts[("faker", "kr1")] = AccountInfo("puuid-faker", "Faker", "KR1", 700)
-    monkeypatch.setattr(app_module, "CassiopeiaClient", lambda key: fake)
+    monkeypatch.setattr(app_module, "HttpRiotClient", lambda key: fake)
     monkeypatch.setattr(app_module, "RetryingClient", lambda inner: inner)   # no real backoff sleeps
     return fake
 
@@ -318,3 +318,10 @@ async def test_weekly_job_alerts_the_admin_when_nothing_was_delivered(make_app, 
 
 async def _record(sent, chat_id, text):
     sent.append((chat_id, text))
+
+
+async def test_shutdown_closes_the_db_and_the_riot_client(make_app, riot, send):
+    _, app = make_app()
+    await start(app)
+    await app.post_shutdown(app)
+    assert riot.closed

@@ -1,31 +1,71 @@
-"""M0 spike — verify Cassiopeia against the LIVE Riot API before trusting the app.
+"""Live smoke test — check the Riot client against the LIVE API before trusting the app.
 
     RIOT_API_KEY=RGAPI-... uv run python scripts/spike.py "GameName#TAG" [platform]
 
-(Or, with no project setup at all: `uv run --with cassiopeia==5.2.0 spike.py ...`.)
-
-Checks, in order:
-  a) account-v1 lookup by Riot ID
+Runs the app's own `HttpRiotClient` (no retries), in order:
+  a) account-v1 lookup by Riot ID (+ summoner level)
   b) match-v5 history + one full match parse
-  c) spectator-v5 live-game lookup by PUUID  <- the load-bearing unknown
-If (c) fails through Cassiopeia but the raw endpoint answers, the script says so:
-implement `is_in_game` with httpx against
-  /lol/spectator/v5/active-games/by-summoner/{puuid}
-and note it in the README. Throwaway: not imported by the app.
+  c) spectator-v5 live-game lookup by PUUID
+Throwaway: not imported by the app.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import traceback
+from pathlib import Path
 
-import cassiopeia as cass
-from cassiopeia.data import Platform
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # run from anywhere
+from lolwatch.riot.http_client import HttpRiotClient  # noqa: E402
 
 
 def step(label: str):
     print(f"\n=== {label}")
+
+
+async def run(key: str, name: str, tag: str, platform: str) -> int:
+    riot = HttpRiotClient(key)
+    results: dict[str, bool] = {}
+    try:
+        step("a) account by Riot ID")
+        try:
+            acct = await riot.resolve_account(name, tag, platform)
+            print(f"OK  {acct.game_name}#{acct.tag_line}  level={acct.summoner_level}  "
+                  f"puuid={acct.puuid[:12]}…")
+            results["a"] = True
+        except Exception:
+            traceback.print_exc()
+            print("FAIL: cannot continue without a PUUID (403 => key expired/invalid)")
+            return 1
+
+        step("b) match-v5 history + full match parse")
+        try:
+            ids = await riot.recent_match_ids(acct.puuid, platform, None, 5)
+            print(f"ids: {ids}")
+            parsed = await riot.get_match(ids[0], platform)
+            me = parsed.participants.get(acct.puuid)
+            print(f"OK  queue={parsed.queue_id} duration={parsed.duration_s}s "
+                  f"remake={parsed.remake} me={me}")
+            results["b"] = me is not None
+        except Exception:
+            traceback.print_exc()
+            results["b"] = False
+
+        step("c) spectator-v5 by PUUID")
+        try:
+            in_game = await riot.is_in_game(acct.puuid, platform)
+            print(f"OK  in_game={in_game}  (False is the normal answer when idle)")
+            results["c"] = True
+        except Exception:
+            traceback.print_exc()
+            results["c"] = False
+    finally:
+        await riot.aclose()
+
+    print("\nSUMMARY:", {k: ("PASS" if v else "FAIL") for k, v in results.items()})
+    return 0 if all(results.values()) else 1
 
 
 def main() -> int:
@@ -37,69 +77,8 @@ def main() -> int:
         print("set RIOT_API_KEY first")
         return 2
     name, _, tag = sys.argv[1].rpartition("#")
-    plat = Platform((sys.argv[2] if len(sys.argv) > 2 else "euw1").upper())
-
-    settings = cass.get_default_config()
-    settings["pipeline"] = {"RiotAPI": {"api_key": key}}
-    settings["logging"]["print_calls"] = False
-    cass.apply_settings(settings)
-    results: dict[str, bool] = {}
-
-    step("a) get_account by Riot ID")
-    try:
-        account = cass.get_account(name=name, tagline=tag, region=plat.region)
-        puuid = account.puuid
-        print(f"OK  {account.name}#{account.tagline}  puuid={puuid[:12]}…")
-        results["a"] = True
-    except Exception:
-        traceback.print_exc()
-        print("FAIL: cannot continue without a PUUID (403 => key expired/invalid)")
-        return 1
-
-    step("b) match-v5 history + full match parse")
-    try:
-        history = cass.get_match_history(continent=plat.continent, puuid=puuid, start=0, count=5)
-        ids = [m.id for m in history][:5]
-        print(f"ids: {ids}")
-        match = cass.get_match(id=ids[0], region=plat.region)
-        match.load()
-        from cassiopeia.core.match import MatchData
-
-        from lolwatch.riot.cassiopeia_impl import core_to_info
-        from lolwatch.riot.parsing import parse_match
-
-        parsed = parse_match(f"{plat.value}_{ids[0]}", core_to_info(match._data[MatchData]))
-        me = parsed.participants.get(puuid)
-        print(f"OK  queue={parsed.queue_id} duration={parsed.duration_s}s remake={parsed.remake} "
-              f"me={me}")
-        results["b"] = me is not None
-    except Exception:
-        traceback.print_exc()
-        results["b"] = False
-
-    step("c) spectator-v5 by PUUID (via Cassiopeia)")
-    try:
-        current = cass.get_current_match(
-            summoner=cass.get_summoner(puuid=puuid, region=plat.region), region=plat.region)
-        print(f"OK  in_game={bool(current.exists)}  (False is the normal answer when idle)")
-        results["c"] = True
-    except Exception:
-        traceback.print_exc()
-        results["c"] = False
-        step("c') raw spectator-v5 endpoint, to see whether the API or Cassiopeia is at fault")
-        try:
-            import httpx
-
-            r = httpx.get(
-                f"https://{plat.value.lower()}.api.riotgames.com"
-                f"/lol/spectator/v5/active-games/by-summoner/{puuid}",
-                headers={"X-Riot-Token": key}, timeout=10)
-            print(f"raw endpoint -> HTTP {r.status_code} (404 = not in game = endpoint works)")
-        except Exception:
-            traceback.print_exc()
-
-    print("\nSUMMARY:", {k: ("PASS" if v else "FAIL") for k, v in results.items()})
-    return 0 if all(results.values()) else 1
+    platform = (sys.argv[2] if len(sys.argv) > 2 else "euw1").lower()
+    return asyncio.run(run(key, name, tag, platform))
 
 
 if __name__ == "__main__":

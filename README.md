@@ -19,7 +19,7 @@ There is no `requirements.txt`, no `pip`, and nothing runs on the system interpr
 | Print the weekly summary, send nothing | `uv run python -m lolwatch.cli dry-run-summary` |
 | Run the tests (no network) | `uv run pytest` |
 | Add a dependency | `uv add <pkg>` (dev: `uv add --dev <pkg>`) |
-| Upgrade one dependency deliberately | `uv lock --upgrade-package cassiopeia` |
+| Upgrade one dependency deliberately | `uv lock --upgrade-package httpx` |
 | Reproduce CI/prod exactly | `uv sync --frozen` |
 
 ## Setup guide
@@ -146,19 +146,17 @@ Restart the bot. Riot lists a match a minute or two after it ends, so allow for 
 | `The Riot API key has changed` warning | PUUIDs are per key. Run `uv run python -m lolwatch.cli repuuid`, then restart. |
 | Weekly summary sent at the wrong hour | `weekly.timezone` must be an IANA name such as `Europe/London`, not `GMT+1`. |
 
-### M0 spike (do this before trusting the bot)
+### Live smoke test (do this before trusting the bot)
 
-`spectator-v5` support in Cassiopeia is verified only by reading its source (it calls
-`/lol/spectator/v5/active-games/by-summoner/{puuid}`), not against the live API. Run:
+The Riot client is tested offline against a mock transport only. Check it against the
+live API once with:
 
 ```
 RIOT_API_KEY=RGAPI-... uv run python scripts/spike.py "GameName#TAG" euw1
 ```
 
-It checks (a) account lookup, (b) match history + a full parse through the real
-adapter code path, (c) live-game lookup. If (c) fails through Cassiopeia but the raw
-endpoint answers, reimplement `is_in_game` with `httpx` inside
-`lolwatch/riot/cassiopeia_impl.py` — nothing else needs to change.
+It runs the app's own client through (a) account lookup, (b) match history + a full
+parse, (c) live-game lookup.
 
 ## Telegram commands
 
@@ -272,10 +270,10 @@ uv run pytest        # 130+ tests, no network
 uv run ruff check .
 ```
 
-Layout: `lolwatch/riot/adapter.py` is the only Riot surface the app sees (the
-Cassiopeia implementation lives behind it); `sessions.py` is pure logic;
+Layout: `lolwatch/riot/adapter.py` is the only Riot surface the app sees (a thin
+`httpx` client in `riot/http_client.py` lives behind it); `sessions.py` is pure logic;
 `formatting.py` / `summary.py` are pure; `flusher.py` is the I/O shell around sessions.
 
 Known limits: test fixtures under `tests/fixtures/` are hand-built to the match-v5
-shape (no live recording was possible without a key), and Cassiopeia itself has only
-been exercised offline — see the M0 spike.
+shape (no live recording was possible without a key), and the Riot client has only
+been exercised offline — see the live smoke test.

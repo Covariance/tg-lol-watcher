@@ -1,7 +1,7 @@
 """The ONLY Riot surface the rest of the app sees.
 
-Nothing outside `lolwatch/riot/` imports Cassiopeia. If Cassiopeia breaks, swap
-the implementation behind this protocol; the app doesn't change.
+Nothing outside `lolwatch/riot/` knows how Riot is reached (`http_client.py`
+today). Swap the implementation behind this protocol; the app doesn't change.
 
 Deviations from the spec's four methods, both driven by other requirements:
 `account_by_puuid` (weekly display-name refresh needs PUUID -> Riot ID) and

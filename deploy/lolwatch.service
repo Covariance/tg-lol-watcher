@@ -8,19 +8,27 @@ Type=simple
 User=lolwatch
 WorkingDirectory=/opt/lolwatch
 EnvironmentFile=/etc/lolwatch/env
-# uv needs writable cache + Python dirs under ProtectSystem=strict; /opt/lolwatch is writable below.
-Environment=UV_CACHE_DIR=/opt/lolwatch/.uv-cache
-Environment=UV_PYTHON_INSTALL_DIR=/opt/lolwatch/.uv-python
-# Absolute path: systemd has no useful PATH, and ~/.local/bin is invisible to this user.
-ExecStartPre=/usr/local/bin/uv sync --frozen --no-dev
-ExecStart=/usr/local/bin/uv run --frozen --no-dev python -m lolwatch
+ExecStart=/opt/lolwatch/lolwatch
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+# The whole process is ~8 MB resident; anything near this is a leak.
+MemoryMax=64M
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 ReadWritePaths=/opt/lolwatch
 
 [Install]

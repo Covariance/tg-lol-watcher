@@ -4,45 +4,40 @@ Watches a set of League of Legends players and posts to Telegram when they finis
 **session** of games (not one message per game), plus a weekly summary of games,
 winrate and time played.
 
-Everything — install, run, test, deploy — goes through [`uv`](https://docs.astral.sh/uv/).
-There is no `requirements.txt`, no `pip`, and nothing runs on the system interpreter.
+This branch is the Rust port: one self-contained ~5 MB binary, two threads, ~8 MB resident,
+no runtime to install. It reads and writes the same SQLite database as the Python
+version, so switching over keeps every player, match and open session.
 
 ## Commands
 
 | Task | Command |
 |---|---|
-| Install / sync from lock | `uv sync` |
-| Run the bot | `uv run python -m lolwatch` |
-| Look up a Riot ID | `uv run python -m lolwatch.cli resolve "Name#TAG" [--platform kr]` |
-| Backfill history (silent) | `uv run python -m lolwatch.cli backfill --days 14` |
-| Re-resolve PUUIDs after a key change | `uv run python -m lolwatch.cli repuuid` |
-| Print the weekly summary, send nothing | `uv run python -m lolwatch.cli dry-run-summary` |
-| Run the tests (no network) | `uv run pytest` |
-| Add a dependency | `uv add <pkg>` (dev: `uv add --dev <pkg>`) |
-| Upgrade one dependency deliberately | `uv lock --upgrade-package httpx` |
-| Reproduce CI/prod exactly | `uv sync --frozen` |
+| Build | `cargo build --release` (binary: `target/release/lolwatch`) |
+| Run the bot | `lolwatch` |
+| Look up a Riot ID | `lolwatch resolve "Name#TAG" [--platform kr]` |
+| Backfill history (silent) | `lolwatch backfill --days 14` |
+| Re-resolve PUUIDs after a key change | `lolwatch repuuid` |
+| Print the weekly summary, send nothing | `lolwatch dry-run-summary [--days N]` |
+| Check the Riot client against the live API | `lolwatch smoke "Name#TAG" [platform]` |
+| Run the tests (no network) | `cargo test` |
+| End-to-end against a mock Riot + Telegram | `tests/e2e/run.sh` (needs `python3`) |
+| Lint / format | `cargo clippy --all-targets` / `cargo fmt` |
 
 ## Setup guide
 
 Local first run, about 15 minutes. Deployment to a server is a separate section below.
 
-### 1. Install uv and the project
+### 1. Build
 
-uv is the only tool you need; it downloads Python 3.12 itself.
-
-```
-# Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Then, in the repo:
+Install Rust with [rustup](https://rustup.rs) (1.85 or newer), then in the repo:
 
 ```
-uv sync
+cargo build --release
 ```
+
+The binary is `target/release/lolwatch`. SQLite is compiled in; the only thing the
+binary needs from the system is the time zone database (`/usr/share/zoneinfo`, present
+on every normal Linux and macOS install; it is built in on Windows).
 
 ### 2. Get a Riot API key
 
@@ -83,31 +78,27 @@ cp .env.example .env        # Windows: copy .env.example .env
 Or export them instead:
 
 ```
-# macOS / Linux / Git Bash
 export RIOT_API_KEY=RGAPI-xxxxxxxx
 export TELEGRAM_BOT_TOKEN=123456:ABC-xxxx
-
-# Windows PowerShell (current window only)
-$env:RIOT_API_KEY = "RGAPI-xxxxxxxx"
-$env:TELEGRAM_BOT_TOKEN = "123456:ABC-xxxx"
 ```
 
 Optional: `LOLWATCH_DB` (default `./lolwatch.db`) and `LOLWATCH_CONFIG` (default `./config.toml`).
 
-### 6. Check the Riot side (M0 spike)
+### 6. Check the Riot side
 
 ```
-uv run python -m lolwatch.cli resolve "Name#TAG" --platform euw1
-uv run python scripts/spike.py "Name#TAG" euw1
+lolwatch resolve "Name#TAG" --platform euw1
+lolwatch smoke "Name#TAG" euw1
 ```
 
 - `resolve` prints the PUUID and level. If it fails with 403, the key is wrong or expired.
-- `spike.py` should print `SUMMARY: {'a': 'PASS', 'b': 'PASS', 'c': 'PASS'}`. If `c` fails, see *M0 spike* below.
+- `smoke` runs the bot's own Riot client (no retries) through (a) account lookup, (b) match
+  history plus a full match parse, (c) live-game lookup, and should end with every check `PASS`.
 
 ### 7. Start the bot
 
 ```
-uv run python -m lolwatch
+lolwatch
 ```
 
 Look for `telegram: connected as @yourbot` and `started: mode=session ...` in the log. Then in Telegram:
@@ -143,21 +134,9 @@ Restart the bot. Riot lists a match a minute or two after it ends, so allow for 
 | Bot says nothing at all | You are not on the allow list. Ask an admin to `/allow <your id>` (the bot logs the ids it ignores: `ignored a message from user_id=...`). |
 | Bot replies "Sorry, I can't do that here." | The command needs an admin, or you used a group that hasn't been `/start`ed. |
 | Games never show up | Check `/list` shows the player and `/status` works. Matches appear 1 to 2 minutes after they end. Turn on `DEBUG` logging. |
-| `The Riot API key has changed` warning | PUUIDs are per key. Run `uv run python -m lolwatch.cli repuuid`, then restart. |
+| `The Riot API key has changed` warning | PUUIDs are per key. Run `lolwatch repuuid`, then restart. |
 | Weekly summary sent at the wrong hour | `weekly.timezone` must be an IANA name such as `Europe/London`, not `GMT+1`. |
 | `unknown timezone` for a valid name on Linux | The system has no tz database (minimal containers). Install it: `apt install tzdata`. |
-
-### Live smoke test (do this before trusting the bot)
-
-The Riot client is tested offline against a mock transport only. Check it against the
-live API once with:
-
-```
-RIOT_API_KEY=RGAPI-... uv run python scripts/spike.py "GameName#TAG" euw1
-```
-
-It runs the app's own client through (a) account lookup, (b) match history + a full
-parse, (c) live-game lookup.
 
 ## Telegram commands
 
@@ -178,7 +157,7 @@ parse, (c) live-game lookup.
 
 ### Who can talk to the bot
 
-Access is default-deny, checked in three places (`lolwatch/bot/auth.py`):
+Access is default-deny, checked in three places (`src/bot.rs`):
 
 1. **Allow list.** Only admins (`telegram.admin_user_ids` in `config.toml`) and users an admin has
    `/allow`ed (stored in the database) get any reaction. Everyone else is ignored silently, in
@@ -210,71 +189,87 @@ History that predates the bot's first sight of a player (first start, `/add`,
 
 ## Deployment (Linux VPS, systemd)
 
+Build on the server, or build elsewhere for the same target and copy the binary.
+
 ```bash
-# 1. uv, system-wide, so the service user can execute it
-curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
-
-# 2. service user + code
+# 1. service user + binary + config
 sudo useradd --system --home /opt/lolwatch --shell /usr/sbin/nologin lolwatch
-sudo git clone <this repo> /opt/lolwatch
-sudo cp /opt/lolwatch/config.example.toml /opt/lolwatch/config.toml   # then edit it
-sudo chown -R lolwatch: /opt/lolwatch
+sudo install -d -o lolwatch -g lolwatch /opt/lolwatch
+sudo install -m 755 target/release/lolwatch /opt/lolwatch/lolwatch
+sudo install -m 644 -o lolwatch config.example.toml /opt/lolwatch/config.toml   # then edit it
 
-# 3. secrets
+# 2. secrets
 sudo install -d -m 700 /etc/lolwatch
 sudo install -m 600 /dev/null /etc/lolwatch/env
 sudoedit /etc/lolwatch/env        # RIOT_API_KEY=...  and  TELEGRAM_BOT_TOKEN=...
 
-# 4. service
-sudo cp /opt/lolwatch/deploy/lolwatch.service /etc/systemd/system/
+# 3. service
+sudo cp deploy/lolwatch.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now lolwatch
 journalctl -u lolwatch -f
 ```
 
-The unit runs `uv sync --frozen --no-dev` before every start, so the environment always
-matches `uv.lock`; `--frozen` fails loudly if `uv.lock` and `pyproject.toml` drifted.
-**Deploy an update:** `cd /opt/lolwatch && sudo -u lolwatch git pull && sudo systemctl restart lolwatch`.
+**Coming from the Python version:** stop it, copy its `lolwatch.db` (and `config.toml`)
+into `/opt/lolwatch`, install the binary as above and start the new unit. The schema, the
+key fingerprint and every stored row are compatible; open sessions are picked up and
+flushed as usual.
+
+**Deploy an update:** rebuild, `sudo install -m 755 target/release/lolwatch /opt/lolwatch/lolwatch`,
+`sudo systemctl restart lolwatch`.
 
 Set `[logging] level = "DEBUG"` to log every notification decision with its session id
-(`session=12 flush decision: flush=False (in game, postponing (2/18))`).
+(`session=12 flush decision: flush=false (in game, postponing (2/18))`).
 
 ### Swapping the API key (dev → personal, or on expiry)
 
 1. Edit `/etc/lolwatch/env`, replace `RIOT_API_KEY`.
 2. `sudo systemctl restart lolwatch`.
 3. **If the key changed type/application** (dev → personal), PUUIDs are encrypted per
-   key and every stored one is now invalid. The bot detects the change, logs a
-   CRITICAL line and alerts the admins. Then run, as the service user with the same
-   environment:
+   key and every stored one is now invalid. The bot detects the change, logs an error
+   and alerts the admins. Then run, as the service user with the same environment:
 
    ```bash
    sudo systemctl stop lolwatch
    sudo systemd-run --wait --pty --uid=lolwatch \
         -p WorkingDirectory=/opt/lolwatch -p EnvironmentFile=/etc/lolwatch/env \
-        -E UV_CACHE_DIR=/opt/lolwatch/.uv-cache \
-        -E UV_PYTHON_INSTALL_DIR=/opt/lolwatch/.uv-python \
-        /usr/local/bin/uv run --frozen --no-dev python -m lolwatch.cli repuuid
+        /opt/lolwatch/lolwatch repuuid
    sudo systemctl start lolwatch
    ```
    (`systemd-run` reads the root-only env file for you; on a dev box just run
-   `uv run python -m lolwatch.cli repuuid` with the variables exported.)
-   `repuuid` re-resolves every `Name#TAG`, rewrites the PUUID across all tables and
-   records the new key fingerprint (which silences the warning).
+   `lolwatch repuuid` with the variables exported.) `repuuid` re-resolves every
+   `Name#TAG`, rewrites the PUUID across all tables and records the new key fingerprint
+   (which silences the warning).
 
 A `403` from Riot sends an admin alert ("key probably expired"), at most once an hour.
 
 ## Development
 
 ```
-uv sync
-uv run pytest        # 130+ tests, no network
-uv run ruff check .
+cargo test                    # ~185 tests, no network
+cargo clippy --all-targets
+tests/e2e/run.sh              # release binary vs. a mock Riot + Telegram
 ```
 
-Layout: `lolwatch/riot/adapter.py` is the only Riot surface the app sees (a thin
-`httpx` client in `riot/http_client.py` lives behind it); `sessions.py` is pure logic;
-`formatting.py` / `summary.py` are pure; `flusher.py` is the I/O shell around sessions.
+Layout (`src/`):
+
+- `riot/` — the `Riot` trait, typed errors and routing (`mod.rs`); the HTTP client with
+  the client-side rate limiter (`client.rs`); retries (`retry.rs`); match-v5 parsing,
+  where the duration/remake/Arena traps live (`parsing.rs`).
+- `sessions.rs`, `summary.rs`, `formatting.rs` — pure logic, no I/O.
+- `flusher.rs` (sessions I/O), `poller.rs` (ingestion), `notifier.rs`, `reports.rs`.
+- `bot.rs` — commands and access control; `telegram.rs` — the Bot API slice we use.
+- `scheduler.rs` — one heap of timed jobs on wall-clock time; `app.rs` — wiring, start-up
+  checks, the two threads.
+- `http.rs` — the only place that does HTTP (`ureq` + rustls), behind a trait for tests.
+
+Design choices for a small footprint: no async runtime (a scheduler thread and a
+Telegram long-poll thread do all the work), one SQLite connection behind a mutex with
+cached prepared statements, match JSON deserialised straight into the few fields used,
+and fat LTO with `panic = "abort"` in release builds.
+
+`LOLWATCH_RIOT_BASE_URL` and `LOLWATCH_TELEGRAM_BASE_URL` point the clients somewhere
+else (the e2e mock uses them; the latter also works with a local Bot API server).
 
 Known limits: test fixtures under `tests/fixtures/` are hand-built to the match-v5
-shape (no live recording was possible without a key), and the Riot client has only
-been exercised offline — see the live smoke test.
+shape, and the client has only been run against the mock — run `lolwatch smoke` once
+with a real key.

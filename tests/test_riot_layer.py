@@ -109,6 +109,19 @@ def test_retry_after_header_is_carried():
     assert mapped.retry_after == 12.0
 
 
+def test_unknown_rate_limit_type_from_cassiopeia_is_a_rate_limit():
+    # Riot's `X-Rate-Limit-Type: server` makes Cassiopeia raise a ValueError
+    exc = ValueError("Unknown cause of rate limit; aborting. Headers were: "
+                     "{'Content-Type': 'application/json', 'Retry-After': '11', "
+                     "'X-Rate-Limit-Type': 'server'}")
+    mapped = map_exception(exc)
+    assert isinstance(mapped, RiotRateLimited) and mapped.retry_after == 11.0
+    assert "Headers were" not in str(mapped)
+
+    mapped = map_exception(ValueError("Unknown cause of rate limit; aborting. Headers were: {}"))
+    assert isinstance(mapped, RiotRateLimited) and mapped.retry_after is None
+
+
 def test_pipeline_not_found_and_network_failures():
     class NotFoundError(Exception):
         pass

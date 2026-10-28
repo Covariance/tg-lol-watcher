@@ -21,6 +21,7 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, TypeVar
@@ -46,6 +47,12 @@ from .parsing import parse_match
 log = logging.getLogger(__name__)
 T = TypeVar("T")
 
+# Cassiopeia 5.2.0 only knows the application/method/service rate-limit types. Riot
+# also sends `X-Rate-Limit-Type: server` (its own backend shedding load), and for that
+# Cassiopeia raises a ValueError with the headers dict stringified into the message.
+_UNKNOWN_RATE_LIMIT = "Unknown cause of rate limit"
+_RETRY_AFTER_RE = re.compile(r"'Retry-After':\s*'(\d+(?:\.\d+)?)'")
+
 
 def map_exception(exc: BaseException) -> RiotError | None:
     """Translate a Cassiopeia/HTTP failure to a typed error, or None if unknown.
@@ -57,6 +64,10 @@ def map_exception(exc: BaseException) -> RiotError | None:
     if isinstance(exc, RiotError):
         return exc
     code = getattr(exc, "code", None)
+    if isinstance(exc, ValueError) and _UNKNOWN_RATE_LIMIT in str(exc):
+        m = _RETRY_AFTER_RE.search(str(exc))
+        return RiotRateLimited("HTTP 429 (Riot server-side throttling)",
+                               retry_after=float(m.group(1)) if m else None)
     if code is None and isinstance(exc, RuntimeError) and "429" in str(exc):
         code = 429
     if code in (401, 403):

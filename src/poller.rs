@@ -192,6 +192,9 @@ impl Poller {
 
     fn is_bad(&self, match_id: &str, puuid: &str) -> bool {
         let mut bad = self.bad_matches.lock().unwrap_or_else(|p| p.into_inner());
+        if bad.is_empty() {
+            return false; // the usual case: no key to build
+        }
         let key = (match_id.to_owned(), puuid.to_owned());
         match bad.get(&key) {
             None => false,

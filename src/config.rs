@@ -102,6 +102,7 @@ impl Config {
     }
 
     /// Defaults with the given secrets; what tests start from.
+    #[cfg(test)]
     pub fn for_tests(admins: &[i64]) -> Self {
         Self {
             default_platform: "euw1".into(),

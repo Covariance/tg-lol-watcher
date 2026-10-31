@@ -37,9 +37,17 @@ impl Notifier {
             truncated = text.chars().take(TELEGRAM_LIMIT - 1).chain(std::iter::once('…')).collect::<String>();
             text = &truncated;
         }
+        let mut chat_id = chat_id;
         for attempt in 1..=2 {
             match self.tg.send_message(chat_id, text, true) {
                 Ok(()) => return true,
+                Err(TgError::Migrated(to)) if attempt == 1 => {
+                    log::info!("chat {chat_id} was upgraded to supergroup {to}; moving its subscription");
+                    if let Err(e) = self.db.migrate_subscriber(chat_id, to) {
+                        log::error!("could not move the subscription of chat {chat_id}: {e}");
+                    }
+                    chat_id = to;
+                }
                 Err(TgError::RetryAfter(seconds)) if attempt == 1 => self.pacer.sleep(seconds),
                 Err(TgError::RetryAfter(_)) => {
                     log::warn!("telegram flood control persisted for chat {chat_id}");
@@ -49,8 +57,8 @@ impl Notifier {
                     log::warn!("telegram refused chat {chat_id} ({reason}); is the bot blocked/removed?");
                     return false;
                 }
-                Err(TgError::Other(reason)) => {
-                    log::warn!("telegram send to {chat_id} failed: {reason}");
+                Err(e @ (TgError::Other(_) | TgError::Migrated(_))) => {
+                    log::warn!("telegram send to {chat_id} failed: {e}");
                     return false;
                 }
             }
@@ -185,6 +193,17 @@ mod tests {
         assert!(notifier(&tg, &db, &pacer).broadcast("hi").unwrap());
         assert_eq!(pacer.sleeps(), [3.0]);
         assert_eq!(tg.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_broadcast_to_an_upgraded_group_follows_it_and_moves_the_subscription() {
+        let db = Arc::new(test_db());
+        db.add_subscriber(-55, T0).unwrap();
+        let tg = Arc::new(FakeTelegram::default());
+        tg.fail_next([TgError::Migrated(-1001)]);
+        assert!(notifier(&tg, &db, &Arc::new(FakePacer::default())).broadcast("hi").unwrap());
+        assert_eq!(tg.sent(), [(-1001, "hi".to_owned())]);
+        assert_eq!(db.subscribers().unwrap(), [-1001]);
     }
 
     #[test]

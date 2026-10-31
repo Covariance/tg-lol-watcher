@@ -654,6 +654,7 @@ impl BotEnv {
                 vec![]
             },
             reply_to_message: None,
+            migrate_from_chat_id: None,
         }
     }
 

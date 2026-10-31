@@ -51,6 +51,9 @@ pub struct Message {
     pub entities: Vec<Entity>,
     #[serde(default)]
     pub reply_to_message: Option<Box<Message>>,
+    /// Service message in a new supergroup: the group it was upgraded from.
+    #[serde(default)]
+    pub migrate_from_chat_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +70,8 @@ pub enum TgError {
     RetryAfter(f64),
     /// 403: the bot was blocked or removed from the chat.
     Forbidden(String),
+    /// The group became a supergroup; it now lives at this chat id.
+    Migrated(i64),
     Other(String),
 }
 
@@ -74,6 +79,7 @@ impl fmt::Display for TgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RetryAfter(s) => write!(f, "flood control: retry after {s}s"),
+            Self::Migrated(to) => write!(f, "group chat was upgraded to supergroup {to}"),
             Self::Forbidden(m) | Self::Other(m) => f.write_str(m),
         }
     }
@@ -111,6 +117,7 @@ struct ApiResponse<T> {
 #[derive(Deserialize)]
 struct ResponseParameters {
     retry_after: Option<f64>,
+    migrate_to_chat_id: Option<i64>,
 }
 
 pub struct BotApi {
@@ -142,10 +149,14 @@ impl BotApi {
             return parsed.result.ok_or_else(|| TgError::Other(format!("{method}: ok without a result")));
         }
         let description = parsed.description.unwrap_or_default();
-        match (parsed.error_code.unwrap_or(response.status), parsed.parameters.and_then(|p| p.retry_after)) {
-            (_, Some(seconds)) => Err(TgError::RetryAfter(seconds)),
-            (403, _) => Err(TgError::Forbidden(description)),
-            (code, _) => Err(TgError::Other(format!("{method}: {code} {description}"))),
+        let (retry_after, migrated) = parsed.parameters.map_or((None, None), |p| (p.retry_after, p.migrate_to_chat_id));
+        match (parsed.error_code.unwrap_or(response.status), retry_after, migrated) {
+            (_, _, Some(to)) => Err(TgError::Migrated(to)),
+            (_, Some(seconds), _) => {
+                Err(TgError::RetryAfter(if seconds.is_finite() { seconds.clamp(0.0, 300.0) } else { 5.0 }))
+            }
+            (403, _, _) => Err(TgError::Forbidden(description)),
+            (code, _, _) => Err(TgError::Other(format!("{method}: {code} {description}"))),
         }
     }
 }
@@ -310,6 +321,16 @@ mod tests {
         assert!(matches!(api.send_message(5, "x", false), Err(TgError::Forbidden(_))));
         let (api, _) = api_returning(502, "<html>bad gateway</html>");
         assert!(matches!(api.send_message(5, "x", false), Err(TgError::Other(_))));
+    }
+
+    #[test]
+    fn a_group_upgrade_reports_the_new_chat_id() {
+        let (api, _) = api_returning(
+            400,
+            r#"{"ok": false, "error_code": 400, "description": "Bad Request: group chat was upgraded to a supergroup chat",
+                "parameters": {"migrate_to_chat_id": -1001234}}"#,
+        );
+        assert_eq!(api.send_message(-55, "x", true), Err(TgError::Migrated(-1001234)));
     }
 
     #[test]

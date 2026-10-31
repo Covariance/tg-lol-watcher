@@ -44,7 +44,11 @@ pub enum Command {
 fn flag_days(args: &[String], default: i64) -> std::result::Result<i64, String> {
     match args {
         [] => Ok(default),
-        [flag, n] if flag == "--days" => n.parse().map_err(|_| format!("--days: not a number: {n:?}")),
+        [flag, n] if flag == "--days" => match n.parse() {
+            // Bounded: date arithmetic past this would overflow (and panic).
+            Ok(days @ 1..=3650) => Ok(days),
+            _ => Err(format!("--days: expected a whole number from 1 to 3650, got {n:?}")),
+        },
         _ => Err(format!("unexpected arguments: {}", args.join(" "))),
     }
 }
@@ -269,7 +273,10 @@ mod tests {
             Ok(Command::Resolve { riot_id: "Faker#KR1".into(), platform: Some("kr".into()) })
         );
         assert!(parse_args(&args("resolve Faker#KR1 --platform mars")).is_err());
-        assert!(parse_args(&args("backfill --days many")).is_err());
+        for bad in ["many", "0", "-3", "99999999999"] {
+            assert!(parse_args(&args(&format!("backfill --days {bad}"))).is_err(), "{bad}");
+            assert!(parse_args(&args(&format!("dry-run-summary --days {bad}"))).is_err(), "{bad}");
+        }
         assert!(parse_args(&args("frobnicate")).is_err());
     }
 

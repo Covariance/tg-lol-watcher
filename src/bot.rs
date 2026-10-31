@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::config::parse_riot_id;
 use crate::db::{DbResult, key_fingerprint};
 use crate::error::{Error, Result};
-use crate::formatting::escape;
+use crate::formatting::{SPLIT_AT, escape, split_message};
 use crate::models::Player;
 use crate::poller::IngestOptions;
 use crate::reports::{broadcast_weekly, render_window};
@@ -99,8 +99,12 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// Lists grow with the number of players and users; past Telegram's limit the
+    /// whole message would be rejected, so long replies go out in line-aligned parts.
     fn reply(&self, text: &str) -> Result<()> {
-        self.send(text, true);
+        for part in split_message(text, SPLIT_AT) {
+            self.send(&part, true);
+        }
         Ok(())
     }
 
@@ -173,6 +177,16 @@ pub fn handle_update(svc: &Services, update: &Update, bot_username: &str) {
     let Some(msg) = &update.message else {
         return;
     };
+    // Telegram's own notice that a group became a supergroup (a new chat id). It only
+    // moves an existing subscription, so it needs no sender check.
+    if let Some(from) = msg.migrate_from_chat_id {
+        match svc.db.migrate_subscriber(from, msg.chat.id) {
+            Ok(true) => log::info!("group {from} became supergroup {}; subscription moved", msg.chat.id),
+            Ok(false) => {}
+            Err(e) => log::error!("could not move the subscription of group {from}: {e}"),
+        }
+        return;
+    }
     // Layer 1, the gate. A failing check must block, not wave everything through.
     match may_use_bot(svc, msg) {
         Ok(true) => {}
@@ -732,6 +746,17 @@ mod tests {
     }
 
     #[test]
+    fn a_group_upgrade_notice_moves_the_subscription_whoever_sent_it() {
+        let env = env();
+        env.svc.db.add_subscriber(GROUP, 0).unwrap();
+        let mut notice = BotEnv::message("", STRANGER, -1009999, "supergroup");
+        notice.text = None;
+        notice.migrate_from_chat_id = Some(GROUP);
+        assert!(env.deliver(notice).is_empty());
+        assert_eq!(env.svc.db.subscribers().unwrap(), [-1009999]);
+    }
+
+    #[test]
     fn a_command_addressed_to_another_bot_or_unknown_is_ignored() {
         let env = env();
         assert!(env.call_raw("/list@someotherbot", ADMIN, PRIVATE, "private").is_empty());
@@ -959,6 +984,18 @@ mod tests {
         env.tg.fail_chat(-3003);
         let reply = env.call("sendweekly", "", ADMIN, PRIVATE, "private").remove(0);
         assert!(!reply.contains('✅') && reply.contains("delivered"));
+    }
+
+    #[test]
+    fn a_list_longer_than_telegrams_limit_arrives_in_parts() {
+        let env = env();
+        for i in 0..150 {
+            env.svc.db.add_player(&make_player_full(&format!("p{i}"), &format!("Player{i:03}"), "EUW")).unwrap();
+        }
+        let replies = env.call("list", "", ADMIN, PRIVATE, "private");
+        assert!(replies.len() > 1, "{}", replies.len());
+        assert!(replies.iter().all(|r| crate::formatting::chars(r) <= SPLIT_AT));
+        assert!(replies.concat().contains("Player149#EUW") && replies.concat().contains("Alice#EUW"));
     }
 
     #[test]

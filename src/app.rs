@@ -3,6 +3,7 @@
 //! reads Telegram.
 
 use std::collections::HashSet;
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -218,6 +219,32 @@ pub fn run_job(svc: &Services, scheduler: &Scheduler, due: i64, job: Job) {
     }
 }
 
+/// Hand Riot-heavy jobs to the background worker; run the rest here.
+///
+/// A poll or name refresh can take minutes when Riot is slow (timeouts, backoff, rate
+/// limits); flush checks and the weekly summary must not wait behind it. The worker
+/// takes a job only when idle (`worker` is a rendezvous channel): a run that comes due
+/// while the previous one is still going is skipped, not queued.
+pub fn dispatch(svc: &Services, scheduler: &Scheduler, worker: &SyncSender<(i64, Job)>, due: i64, job: Job) {
+    if !matches!(job, Job::Poll | Job::Names) {
+        return run_job(svc, scheduler, due, job);
+    }
+    match worker.try_send((due, job)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            log::warn!("{job:?} job still running from its last run; skipping this one");
+            match job {
+                Job::Poll => {
+                    let interval = svc.cfg.poll_interval_seconds * 1000;
+                    scheduler.at(next_repeat(due, interval, scheduler.now()), Job::Poll);
+                }
+                _ => scheduler.after(60_000, job),
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => run_job(svc, scheduler, due, job), // no worker: do it here
+    }
+}
+
 /// Read Telegram forever, one update at a time (like python-telegram-bot's default).
 fn poll_telegram(svc: &Services, username: &str) {
     if let Err(e) = svc.tg.drop_pending_updates() {
@@ -234,7 +261,7 @@ fn poll_telegram(svc: &Services, username: &str) {
                     handle_update(svc, &update, username);
                 }
             }
-            Err(TgError::RetryAfter(seconds)) => std::thread::sleep(Duration::from_secs_f64(seconds)),
+            Err(TgError::RetryAfter(seconds)) => RealPacer::default().sleep(seconds),
             Err(e) => {
                 log::warn!("telegram getUpdates failed: {e}; retrying in {backoff:.0}s");
                 std::thread::sleep(Duration::from_secs_f64(backoff));
@@ -271,8 +298,20 @@ pub fn run(cfg: Config) -> Result<(), StartupError> {
         .spawn(move || poll_telegram(&reader, &username))
         .map_err(|e| StartupError(format!("could not start the Telegram thread: {e}")))?;
 
+    let (worker, jobs) = sync_channel::<(i64, Job)>(0);
+    let (bg_svc, bg_scheduler) = (svc.clone(), scheduler.clone());
+    std::thread::Builder::new()
+        .name("riot-poll".into())
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            while let Ok((due, job)) = jobs.recv() {
+                run_job(&bg_svc, &bg_scheduler, due, job);
+            }
+        })
+        .map_err(|e| StartupError(format!("could not start the polling thread: {e}")))?;
+
     while let Some((due, job)) = scheduler.next() {
-        run_job(&svc, &scheduler, due, job);
+        dispatch(&svc, &scheduler, &worker, due, job);
     }
     Ok(())
 }
@@ -395,6 +434,35 @@ mod tests {
         w.tg.fail_chat(-5);
         run_job(&w.svc, &w.scheduler, T0, Job::Weekly);
         assert!(w.tg.sent().iter().any(|(c, t)| *c == 777 && t.contains("could not be delivered")));
+    }
+
+    #[test]
+    fn a_poll_still_running_is_skipped_but_flushes_are_never_held_behind_it() {
+        let w = world();
+        let (worker, jobs) = sync_channel::<(i64, Job)>(0); // nobody receiving: the worker is busy
+        dispatch(&w.svc, &w.scheduler, &worker, T0, Job::Poll);
+        assert_eq!(w.scheduler.pending(), [(T0 + 120_000, Job::Poll)]); // skipped, next slot queued
+        assert!(jobs.try_recv().is_err());
+
+        dispatch(&w.svc, &w.scheduler, &worker, T0, Job::Flush(3)); // runs right here, not queued
+        assert!(w.riot.in_game_calls() == 0 && w.scheduler.pending().len() == 1); // no session 3: no-op
+
+        let idle = std::thread::spawn(move || jobs.recv().unwrap()); // an idle worker takes the job
+        std::thread::sleep(Duration::from_millis(100)); // let it park in recv()
+        dispatch(&w.svc, &w.scheduler, &worker, T0 + 5, Job::Names);
+        assert_eq!(idle.join().unwrap(), (T0 + 5, Job::Names));
+    }
+
+    #[test]
+    fn with_no_worker_the_job_runs_inline() {
+        let db = Arc::new(test_db());
+        db.add_player(&make_player()).unwrap();
+        let w = world_with(db, "RGAPI-one");
+        let (worker, jobs) = sync_channel::<(i64, Job)>(0);
+        drop(jobs);
+        dispatch(&w.svc, &w.scheduler, &worker, T0, Job::Poll);
+        assert_eq!(w.riot.id_calls().len(), 1);
+        assert!(w.scheduler.pending().contains(&(T0 + 120_000, Job::Poll)));
     }
 
     #[test]

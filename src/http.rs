@@ -75,12 +75,13 @@ impl Http for UreqHttp {
 /// Percent-encode a URL path segment (everything but unreserved characters), like
 /// Python's `quote(s, safe="")`.
 pub fn encode_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            out.extend(['%', HEX[(byte >> 4) as usize] as char, HEX[(byte & 15) as usize] as char]);
         }
     }
     out

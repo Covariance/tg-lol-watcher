@@ -18,6 +18,14 @@ use crate::models::{AccountInfo, MatchData};
 /// Dev and personal keys: 20 requests/second and 100 per 2 minutes.
 pub const APP_RATE_LIMITS: &[(usize, f64)] = &[(20, 1.0), (100, 120.0)];
 const DEFAULT_429_PAUSE_S: f64 = 5.0;
+/// One full 2-minute application window: no server-sent wait is honoured beyond it.
+pub const MAX_RETRY_AFTER_S: f64 = 130.0;
+
+/// A server-supplied wait, made safe to sleep on: `inf`, `NaN`, negative or absurd
+/// values would otherwise panic `Duration::from_secs_f64` or stall every caller.
+pub fn sane_wait(seconds: f64) -> Option<f64> {
+    (seconds.is_finite() && seconds >= 0.0).then(|| seconds.min(MAX_RETRY_AFTER_S))
+}
 
 /// Client-side sliding windows over the application rate limits.
 ///
@@ -42,6 +50,7 @@ impl RateLimiter {
 
     pub fn pause(&self, seconds: f64) {
         let mut state = self.state.lock().unwrap();
+        let seconds = sane_wait(seconds).unwrap_or(DEFAULT_429_PAUSE_S);
         state.paused_until = state.paused_until.max(self.pacer.monotonic_s() + seconds);
     }
 
@@ -106,7 +115,7 @@ pub fn map_status(response: &Response, path: &str) -> Option<RiotError> {
             let kind = response.rate_limit_type.as_deref().unwrap_or("service");
             RiotError::RateLimited {
                 message: format!("{what} ({kind} limit)"),
-                retry_after: response.retry_after.as_deref().and_then(|v| v.trim().parse().ok()),
+                retry_after: response.retry_after.as_deref().and_then(|v| v.trim().parse().ok()).and_then(sane_wait),
             }
         }
         500.. => RiotError::Unavailable(what),
@@ -373,6 +382,32 @@ mod tests {
                 Err(RiotError::RateLimited { retry_after, .. }) => assert_eq!(retry_after, Some(11.0)),
                 other => panic!("{kind:?}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn hostile_retry_after_values_are_clamped_not_slept_on() {
+        // "inf" used to reach Duration::from_secs_f64 (a panic, i.e. an abort in release);
+        // "1e10" paused every Riot call for 317 years.
+        for (header, want) in [("inf", None), ("NaN", None), ("-5", None), ("1e10", Some(130.0)), ("7", Some(7.0))] {
+            let pacer = Arc::new(FakePacer::default());
+            let http = Arc::new(FakeHttp::default());
+            http.route_full(
+                "europe/riot/account/v1/accounts/by-puuid/p",
+                Response {
+                    status: 429,
+                    retry_after: Some(header.into()),
+                    rate_limit_type: Some("server".into()),
+                    body: vec![],
+                },
+            );
+            let c = HttpRiotClient::new("k", http.clone(), RateLimiter::new(APP_RATE_LIMITS, pacer.clone()));
+            match c.account_by_puuid("p", "euw1") {
+                Err(RiotError::RateLimited { retry_after, .. }) => assert_eq!(retry_after, want, "{header}"),
+                other => panic!("{header}: {other:?}"),
+            }
+            c.is_in_game("p", "euw1").unwrap(); // waits out the pause, finitely
+            assert_eq!(pacer.sleeps(), [want.unwrap_or(DEFAULT_429_PAUSE_S)], "{header}");
         }
     }
 

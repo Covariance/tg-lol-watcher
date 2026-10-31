@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
 
 use crate::models::{Match, Player, Session};
@@ -150,6 +150,9 @@ impl Database {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Every query below is `prepare_cached`; the default cache (16) holds fewer than
+        // the app's ~30 statements, so they would keep evicting each other.
+        conn.set_prepared_statement_cache_capacity(64);
         let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
@@ -280,13 +283,17 @@ impl Database {
     // -- matches --------------------------------------------------------------
 
     pub fn known_match_ids(&self, puuid: &str, match_ids: &[String]) -> DbResult<HashSet<String>> {
-        if match_ids.is_empty() {
-            return Ok(HashSet::new());
+        // One primary-key probe per id through one cached statement: no SQL built per
+        // call, and no cache slot per distinct list length.
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT 1 FROM matches WHERE match_id=?1 AND puuid=?2")?;
+        let mut known = HashSet::new();
+        for id in match_ids {
+            if stmt.exists(params![id, puuid])? {
+                known.insert(id.clone());
+            }
         }
-        let marks = vec!["?"; match_ids.len()].join(",");
-        let sql = format!("SELECT match_id FROM matches WHERE puuid=? AND match_id IN ({marks})");
-        let args = std::iter::once(puuid).chain(match_ids.iter().map(String::as_str));
-        self.conn().prepare_cached(&sql)?.query_map(params_from_iter(args), |r| r.get(0))?.collect()
+        Ok(known)
     }
 
     /// true if inserted, false if it was already stored (idempotent).
@@ -432,6 +439,20 @@ impl Database {
     pub fn remove_subscriber(&self, chat_id: i64) -> DbResult<bool> {
         let n = self.conn().prepare_cached("DELETE FROM subscribers WHERE chat_id=?1")?.execute([chat_id])?;
         Ok(n == 1)
+    }
+
+    /// A group became a supergroup: its subscription follows it to the new chat id.
+    /// true if a subscription moved.
+    pub fn migrate_subscriber(&self, from: i64, to: i64) -> DbResult<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let moved = tx.execute(
+            "INSERT OR IGNORE INTO subscribers(chat_id, added_at) SELECT ?2, added_at FROM subscribers WHERE chat_id=?1",
+            [from, to],
+        )?;
+        let removed = tx.execute("DELETE FROM subscribers WHERE chat_id=?1", [from])?;
+        tx.commit()?;
+        Ok(moved + removed > 0)
     }
 
     pub fn is_subscriber(&self, chat_id: i64) -> DbResult<bool> {
@@ -644,6 +665,18 @@ mod tests {
         db.kv_set("k", "2").unwrap();
         assert_eq!(db.kv_get("k").unwrap().as_deref(), Some("2"));
         assert_eq!(db.kv_get("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_subscription_follows_a_group_upgrade() {
+        let db = test_db();
+        db.add_subscriber(-55, T0).unwrap();
+        assert!(db.migrate_subscriber(-55, -1001).unwrap());
+        assert_eq!(db.subscribers().unwrap(), [-1001]);
+        assert!(!db.migrate_subscriber(-55, -1001).unwrap()); // idempotent
+        db.add_subscriber(-66, T0).unwrap();
+        assert!(db.migrate_subscriber(-66, -1001).unwrap()); // target already subscribed
+        assert_eq!(db.subscribers().unwrap(), [-1001]);
     }
 
     #[test]

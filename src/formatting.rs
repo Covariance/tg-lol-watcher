@@ -166,6 +166,41 @@ pub fn format_session(player: &Player, matches: &[Match]) -> String {
     }
 }
 
+/// Split a message into parts of at most `limit` chars at line breaks. Only for text
+/// whose tags open and close on one line (a lone over-long line is cut by chars).
+pub fn split_message(text: &str, limit: usize) -> Vec<String> {
+    if chars(text) <= limit {
+        return vec![text.to_owned()];
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+    for line in text.split('\n') {
+        let mut line_len = chars(line);
+        let mut line = line;
+        let cut;
+        if line_len > limit {
+            cut = line.chars().take(limit - 1).chain(std::iter::once('…')).collect::<String>();
+            line = &cut;
+            line_len = limit;
+        }
+        if current_len > 0 && current_len + 1 + line_len > limit {
+            parts.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if current_len > 0 {
+            current.push('\n');
+            current_len += 1;
+        }
+        current.push_str(line);
+        current_len += line_len;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 // -- weekly -------------------------------------------------------------------
 
 fn month(d: Date) -> &'static str {
@@ -362,6 +397,19 @@ mod tests {
             })],
         );
         assert!(text.contains("Arena") && !text.contains("WIN") && !text.contains("LOSS"));
+    }
+
+    #[test]
+    fn long_messages_split_on_line_breaks_under_the_limit() {
+        assert_eq!(split_message("short", 10), ["short"]);
+        let lines: Vec<String> =
+            (0..300).map(|i| format!("• <b>Player{i:03}#EUW</b> (euw1) — last game 2h ago")).collect();
+        let text = lines.join("\n");
+        let parts = split_message(&text, SPLIT_AT);
+        assert!(parts.len() > 1 && parts.iter().all(|p| chars(p) <= SPLIT_AT));
+        assert_eq!(parts.join("\n"), text); // nothing lost, nothing torn mid-line
+        let giant = "é".repeat(50);
+        assert!(split_message(&giant, 10).iter().all(|p| chars(p) <= 10));
     }
 
     #[test]

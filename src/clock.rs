@@ -36,8 +36,10 @@ impl Pacer for RealPacer {
     }
 
     fn sleep(&self, seconds: f64) {
-        if seconds > 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(seconds));
+        // Belt and braces: callers sanitise server-sent waits, but a non-finite value
+        // here would panic, and a panic aborts the release build.
+        if seconds.is_finite() && seconds > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(seconds.min(3600.0)));
         }
     }
 }
